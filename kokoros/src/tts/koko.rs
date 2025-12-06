@@ -376,35 +376,64 @@ impl TTSKoko {
         fn split_words_and_punct(s: &str) -> Vec<String> {
             let mut out = Vec::new();
             for raw in s.split_whitespace() {
-                let mut start = 0usize;
-                let mut end = raw.len();
                 let chars: Vec<char> = raw.chars().collect();
+                let chars_len = chars.len();
+                
+                if chars_len == 0 {
+                    continue;
+                }
+                
+                let mut start = 0usize;
+                // Initialize end to chars_len, but ensure it never exceeds it
+                let mut end = chars_len.min(chars_len);
 
-                // Leading punctuation
-                while start < end {
-                    let c = chars[start];
-                    if ".,!?:;".contains(c) {
-                        out.push(c.to_string());
-                        start += 1;
+                // Leading punctuation - bounds check on every access
+                while start < chars_len {
+                    if let Some(&c) = chars.get(start) {
+                        if ".,!?:;".contains(c) {
+                            out.push(c.to_string());
+                            start += 1;
+                        } else {
+                            break;
+                        }
                     } else {
                         break;
                     }
                 }
-                // Trailing punctuation
-                while end > start {
-                    let c = chars[end - 1];
-                    if ".,!?:;".contains(c) {
-                        end -= 1;
+                // Trailing punctuation - ensure end is bounded and end - 1 is valid
+                // Clamp end to chars_len before the loop to prevent any out-of-bounds access
+                end = end.min(chars_len);
+                while end > start && end > 0 {
+                    // Use saturating_sub to prevent underflow, then verify bounds
+                    let idx = end.saturating_sub(1);
+                    // Triple-check bounds: idx must be valid, < chars_len, and >= start
+                    if idx < chars_len && idx >= start {
+                        if let Some(&c) = chars.get(idx) {
+                            if ".,!?:;".contains(c) {
+                                end = idx;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
                     } else {
                         break;
                     }
                 }
-                if start < end {
-                    out.push(chars[start..end].iter().collect());
+                // Final bounds check - ensure end is properly bounded
+                let end = end.min(chars_len).max(start);
+                if start < end && end <= chars_len && start < chars_len {
+                    if let Some(slice) = chars.get(start..end) {
+                        out.push(slice.iter().collect());
+                    }
                 }
                 // Push trailing punctuation in original order
-                for i in end..chars.len() {
-                    out.push(chars[i].to_string());
+                let end = end.min(chars_len);
+                for i in end..chars_len {
+                    if let Some(&c) = chars.get(i) {
+                        out.push(c.to_string());
+                    }
                 }
             }
             out
@@ -447,7 +476,10 @@ impl TTSKoko {
             for (i, &c) in per_item_token_counts.iter().enumerate() {
                 let scaled = (c as f64) * scale;
                 let floored = scaled.floor() as usize;
-                adjusted_counts[i] = floored;
+                // Bounds check before accessing adjusted_counts
+                if i < adjusted_counts.len() {
+                    adjusted_counts[i] = floored;
+                }
                 new_sum += floored;
                 fractional.push((i, scaled - floored as f64));
             }
@@ -456,8 +488,13 @@ impl TTSKoko {
             fractional.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (i, _) in fractional {
                 if remaining == 0 { break; }
-                adjusted_counts[i] += 1;
-                remaining -= 1;
+                // Bounds check before accessing adjusted_counts
+                if i < adjusted_counts.len() {
+                    adjusted_counts[i] += 1;
+                    remaining -= 1;
+                } else {
+                    break;
+                }
             }
             tracing::debug!("Alignment: rescaled per-item token counts from {} to {} to match durations length {}.", sum_counts, adjusted_counts.iter().sum::<usize>(), target_len);
             sum_counts = adjusted_counts.iter().sum();
@@ -469,7 +506,8 @@ impl TTSKoko {
         let mut cursor = 0usize;
         for (idx, item) in items.iter().enumerate() {
             let cnt = adjusted_counts.get(idx).copied().unwrap_or(0);
-            if per_item_is_punct[idx] {
+            let is_punct = per_item_is_punct.get(idx).copied().unwrap_or(false);
+            if is_punct {
                 // Zero-length marker at current cursor
                 word_map.push((item.clone(), cursor, cursor));
             } else {
@@ -482,9 +520,14 @@ impl TTSKoko {
 
         // If our mapping under-ran due to rounding issues, extend the last non-punct item to cover all tokens
         if cursor < target_len {
-            if let Some(last_non_punct_pos) = (0..word_map.len()).rev().find(|&i| !(per_item_is_punct[i])) {
-                let (w, s, _e) = &word_map[last_non_punct_pos];
-                word_map[last_non_punct_pos] = (w.clone(), *s, target_len);
+            if let Some(last_non_punct_pos) = (0..word_map.len()).rev().find(|&i| {
+                per_item_is_punct.get(i).copied().unwrap_or(false) == false
+            }) {
+                if last_non_punct_pos < word_map.len() {
+                    if let Some((w, s, _e)) = word_map.get(last_non_punct_pos) {
+                        word_map[last_non_punct_pos] = (w.clone(), *s, target_len);
+                    }
+                }
             }
         }
 
@@ -894,8 +937,16 @@ impl TTSKoko {
     ) -> Result<Vec<Vec<f32>>, Box<dyn std::error::Error>> {
         if !style_name.contains("+") {
             if let Some(style) = self.styles.get(style_name) {
-                let styles = vec![style[tokens_len][0].to_vec()];
-                Ok(styles)
+                // Bounds check before accessing style array
+                if tokens_len < style.len() {
+                    let styles = vec![style[tokens_len][0].to_vec()];
+                    Ok(styles)
+                } else {
+                    // Fallback to last available style if tokens_len is too large
+                    let last_idx = style.len().saturating_sub(1);
+                    let styles = vec![style[last_idx][0].to_vec()];
+                    Ok(styles)
+                }
             } else {
                 Err(format!("can not found from styles_map: {}", style_name).into())
             }
@@ -920,7 +971,9 @@ impl TTSKoko {
 
             for (name, portion) in style_names.iter().zip(style_portions.iter()) {
                 if let Some(style) = self.styles.get(*name) {
-                    let style_slice = &style[tokens_len][0]; // This is a [256] array
+                    // Bounds check before accessing style array
+                    let style_idx = tokens_len.min(style.len().saturating_sub(1));
+                    let style_slice = &style[style_idx][0]; // This is a [256] array
                     // Blend into the blended_style
                     for j in 0..256 {
                         blended_style[0][j] += style_slice[j] * portion;
