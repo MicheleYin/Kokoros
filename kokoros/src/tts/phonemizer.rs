@@ -1,9 +1,11 @@
 use crate::tts::normalize;
 use crate::tts::vocab::VOCAB;
+#[cfg(feature = "espeak")]
 use espeak_rs::text_to_phonemes;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::path::PathBuf;
+#[cfg(feature = "espeak")]
 use std::sync::Mutex;
 use voirs_g2p::backends::rule_based::RuleBasedG2p;
 use voirs_g2p::{G2p, LanguageCode};
@@ -19,8 +21,12 @@ lazy_static! {
     // Pattern to fix "ninti" -> "nindi" (simplified from lookbehind/lookahead)
     // Match "nˈaɪnti" not followed by "ː"
     static ref NINETY_PATTERN: Regex = Regex::new(r"(nˈaɪn)ti([^ː]|$)").unwrap();
-    // Global mutex to serialize espeak-rs calls to prevent phoneme randomization
-    static ref ESPEAK_MUTEX: Mutex<()> = Mutex::new(());
+}
+
+// Global mutex to serialize espeak-rs calls to prevent phoneme randomization
+#[cfg(feature = "espeak")]
+lazy_static::lazy_static! {
+    static ref ESPEAK_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 /// Backend type enum
@@ -32,11 +38,13 @@ pub enum BackendType {
 }
 
 /// Espeak backend implementation
+#[cfg(feature = "espeak")]
 struct EspeakBackend {
     preserve_punctuation: bool,
     with_stress: bool,
 }
 
+#[cfg(feature = "espeak")]
 impl EspeakBackend {
     fn new(preserve_punctuation: bool, with_stress: bool) -> Self {
         EspeakBackend {
@@ -51,6 +59,24 @@ impl EspeakBackend {
             .ok()
             .map(|phonemes| phonemes.join(""))
     }
+    
+    /// Check if espeak is available
+    fn is_available() -> bool {
+        // If espeak-rs is compiled in, it should be available
+        // We can't really test at compile time, so we assume it's available if the feature is enabled
+        true
+    }
+}
+
+/// Check if espeak is available at runtime
+#[cfg(not(feature = "espeak"))]
+fn espeak_available() -> bool {
+    false
+}
+
+#[cfg(feature = "espeak")]
+fn espeak_available() -> bool {
+    EspeakBackend::is_available()
 }
 
 /// RuleBasedG2p backend implementation using voirs-g2p
@@ -143,6 +169,7 @@ impl RuleBasedG2pBackend {
 
 /// Enum to hold different backend implementations
 enum Backend {
+    #[cfg(feature = "espeak")]
     Espeak(EspeakBackend),
     RuleBasedG2p(RuleBasedG2pBackend),
 }
@@ -150,6 +177,7 @@ enum Backend {
 impl Backend {
     fn phonemize(&self, text: &str, language: &str) -> Option<String> {
         match self {
+            #[cfg(feature = "espeak")]
             Backend::Espeak(backend) => backend.phonemize(text, language),
             Backend::RuleBasedG2p(backend) => backend.phonemize(text, language),
         }
@@ -168,9 +196,14 @@ pub struct Phonemizer {
 }
 
 impl Phonemizer {
-    /// Create a new Phonemizer with Espeak backend (default)
+    /// Create a new Phonemizer with Espeak backend (default if available, otherwise falls back to VoirsG2p)
     pub fn new(lang: &str) -> Self {
-        Self::new_with_backend(lang, BackendType::Espeak, None)
+        // Try espeak first if available, otherwise fallback to VoirsG2p
+        if cfg!(feature = "espeak") && espeak_available() {
+            Self::new_with_backend(lang, BackendType::Espeak, None)
+        } else {
+            Self::new_with_backend(lang, BackendType::VoirsG2p, None)
+        }
     }
 
     /// Create a new Phonemizer with specified backend
@@ -180,8 +213,21 @@ impl Phonemizer {
         _model_path: Option<PathBuf>,
     ) -> Self {
         let backend = match backend_type {
+            #[cfg(feature = "espeak")]
             BackendType::Espeak => {
-                Backend::Espeak(EspeakBackend::new(true, true))
+                if espeak_available() {
+                    Backend::Espeak(EspeakBackend::new(true, true))
+                } else {
+                    // Fallback to VoirsG2p if espeak requested but not available
+                    let lang_code = RuleBasedG2pBackend::language_str_to_code(lang);
+                    Backend::RuleBasedG2p(RuleBasedG2pBackend::new(lang_code))
+                }
+            }
+            #[cfg(not(feature = "espeak"))]
+            BackendType::Espeak => {
+                // Espeak not compiled in, fallback to VoirsG2p
+                let lang_code = RuleBasedG2pBackend::language_str_to_code(lang);
+                Backend::RuleBasedG2p(RuleBasedG2pBackend::new(lang_code))
             }
             BackendType::VoirsG2p => {
                 // Convert language string to LanguageCode
