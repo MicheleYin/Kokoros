@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use regex::Regex;
+use fancy_regex::Regex;
 
 lazy_static! {
     static ref WHITESPACE_RE: Regex = Regex::new(r"[^\S \n]").unwrap();
@@ -63,7 +63,7 @@ pub fn normalize_text(text: &str) -> String {
 
     // Handle initials and acronyms
     text = INITIALS_RE
-        .replace_all(&text, |caps: &regex::Captures| caps[0].replace('.', "-"))
+        .replace_all(&text, |caps: &fancy_regex::Captures| caps[0].replace('.', "-"))
         .to_string();
     text = ACRONYM_RE.replace_all(&text, "-").to_string();
 

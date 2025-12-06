@@ -1607,6 +1607,7 @@ name = "kokoros"
 version = "0.1.0"
 dependencies = [
  "espeak-rs",
+ "fancy-regex",
  "futures",
  "hound",
  "indicatif",
