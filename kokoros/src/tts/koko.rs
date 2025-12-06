@@ -206,11 +206,57 @@ impl TTSKoko {
             let chunk_audio: Vec<f32> = chunk_audio_array.iter().cloned().collect();
 
             // F. Calculate Alignments
+
+            // Note: Durations from the model are in mel-spectrogram frames.
+
+            // The Kokoro model uses 80 Hz frame rate (12.5ms per frame).
+
+            // At 24kHz sample rate: 80 frames/sec = 300 samples per frame.
+
+            // This is independent of the audio sample rate.
+
             if let Some(durations) = chunk_durations_opt {
                 let mut alignments = Vec::new();
 
-                // Model durations are in frames (hop=600 @ 24 kHz) ⇒ 40 frames/sec.
-                let frames_per_sec: f32 = 40.0;
+                // Calculate total frames used by word alignments (excluding padding)
+                let mut total_word_frames = 0.0f32;
+                for (_word, start, end) in &word_map {
+                    let adj_start = start + index_offset;
+                    let adj_end = end + index_offset;
+                    if adj_end <= durations.len() {
+                        total_word_frames += durations[adj_start..adj_end].iter().sum::<f32>();
+                    }
+                }
+
+                let audio_duration_sec = chunk_audio.len() as f32 / 24000.0;
+
+                // Calculate frame rate based on word alignments vs audio
+                // This gives us the actual frame rate for speech content
+                let calculated_frame_rate = if total_word_frames > 0.0 && audio_duration_sec > 0.0 {
+                    total_word_frames / audio_duration_sec
+                } else {
+                    80.0 // fallback
+                };
+
+                // Use calculated frame rate if reasonable, otherwise use 80 Hz
+                // Standard mel-spectrogram frame rates are typically 30-200 Hz
+                // Some models may use lower rates, so we allow 30+ Hz
+                // The calculated rate ensures durations match the actual audio length
+                let frames_per_sec: f32 = if calculated_frame_rate >= 30.0 && calculated_frame_rate <= 200.0 {
+                    calculated_frame_rate
+                } else {
+                    // Fall back to standard 80 Hz if calculated rate is unreasonable
+                    tracing::warn!(
+                        "{} {}Calculated frame rate {:.2} Hz is outside reasonable range (30-200 Hz), using 80 Hz",
+                        debug_prefix, chunk_info, calculated_frame_rate
+                    );
+                    80.0
+                };
+
+                tracing::debug!(
+                    "{} {}Using frame rate: {:.2} Hz (word_frames={:.2}, audio_sec={:.3})",
+                    debug_prefix, chunk_info, frames_per_sec, total_word_frames, audio_duration_sec
+                );
 
                 // Guard speed to avoid division by zero; timestamps should reflect the final render timeline.
                 let speed_safe = if speed > 1e-6 { speed } else { 1.0 };
@@ -218,13 +264,13 @@ impl TTSKoko {
                 // Include initial "silence tokens" time into the local time cursor. You already shift the
                 // durations index by `index_offset = 1 + silence_count`; here we also advance the cursor by
                 // the skipped frames so the first word starts at the actual audio time.
-                let mut chunk_time_cursor_frames: f32 = 0.0;
+                let mut chunk_time_cursor = 0.0;
                 if silence_count > 0 {
                     let start = 1; // skip BOS
                     let end = (1 + silence_count).min(durations.len());
                     if end > start {
                         let silence_frames: f32 = durations[start..end].iter().sum();
-                        chunk_time_cursor_frames += silence_frames;
+                        chunk_time_cursor += silence_frames;
                     }
                 }
 
@@ -248,60 +294,27 @@ impl TTSKoko {
                         // Scale pauses by 1/speed so timestamps match rendered audio when speech rate changes.
                         let pause_s = punct_pause_s(&word) / speed_safe;
                         let pause_frames = pause_s * frames_per_sec;
-                        let start_sec = chunk_time_cursor_frames / frames_per_sec;
-                        let end_sec = (chunk_time_cursor_frames + pause_frames) / frames_per_sec;
+                        let start_sec = chunk_time_cursor / frames_per_sec;
+                        let end_sec = (chunk_time_cursor + pause_frames) / frames_per_sec;
                         alignments.push(WordAlignment { word: word.clone(), start_sec, end_sec });
-                        chunk_time_cursor_frames += pause_frames;
+                        chunk_time_cursor += pause_frames;
                         continue;
                     }
 
                     // Normal word span: sum its frame durations and advance the cursor.
                     if adj_start < adj_end && adj_end <= durations.len() {
-                        let mut word_frames: f32 = durations[adj_start..adj_end].iter().sum();
+                        let word_frames: f32 = durations[adj_start..adj_end].iter().sum();
 
                         // If your ONNX `durations` do NOT already include speed scaling, uncomment this line:
                         // word_frames /= speed_safe;
                         // (Leave it commented if the model already produces speed‑scaled durations.)
 
-                        let start_sec = chunk_time_cursor_frames / frames_per_sec;
-                        let end_sec = (chunk_time_cursor_frames + word_frames) / frames_per_sec;
-                        alignments.push(WordAlignment { word, start_sec, end_sec });
-                        chunk_time_cursor_frames += word_frames;
-                    }
-                }
-
-                // Per‑chunk closure: linearly scale the local alignment times to match this chunk’s audio length.
-                // This eliminates cumulative drift across chunks and prevents middle events from sliding late.
-                let t_end_sec = chunk_time_cursor_frames / frames_per_sec; // alignment‑derived duration (sec)
-                let chunk_audio_sec = chunk_audio.len() as f32 / 24_000.0; // audio duration (sec)
-
-                if t_end_sec > 0.0 {
-                    let s = (chunk_audio_sec / t_end_sec);
-                    // Optionally clamp extreme corrections; typical values should be close to 1.0
-                    let s_clamped = s.clamp(0.8, 1.25);
-                    if (s_clamped - 1.0).abs() > 0.005 { // >0.5% correction
-                        tracing::debug!(scale = s_clamped, "Per-chunk alignment scaling applied (speed-aware)");
-                        for al in &mut alignments {
-                            al.start_sec *= s_clamped;
-                            al.end_sec   *= s_clamped;
-                        }
-                    }
-
-                    // Optional sanity log after scaling
-                    let diff_ms = (((t_end_sec * s_clamped) - chunk_audio_sec) * 1000.0).abs();
-                    if diff_ms > 10.0 {
-                        tracing::warn!(
-                chunk_t_end_sec = t_end_sec * s_clamped,
-                chunk_audio_sec,
-                diff_ms,
-                "Alignment vs audio duration still off after scaling",
-            );
-                    } else {
-                        tracing::debug!(
-                chunk_t_end_sec = t_end_sec * s_clamped,
-                chunk_audio_sec,
-                "Chunk alignment closure OK",
-            );
+                        alignments.push(WordAlignment {
+                            word,
+                            start_sec: chunk_time_cursor / frames_per_sec,
+                            end_sec: (chunk_time_cursor + word_frames) / frames_per_sec,
+                        });
+                        chunk_time_cursor += word_frames;
                     }
                 }
 
@@ -348,6 +361,55 @@ impl TTSKoko {
                         }
                     }
                 }
+                
+                // Normalize alignments to match actual audio duration
+                // This ensures accuracy when model-predicted durations don't perfectly match generated audio
+                if !batch_alignments.is_empty() && !batch_audio.is_empty() {
+                    let audio_duration_sec = batch_audio.len() as f32 / sample_rate;
+                    let alignment_duration = batch_alignments.last().unwrap().end_sec;
+                    
+                    if alignment_duration > 0.0 && audio_duration_sec > 0.0 {
+                        let scale = audio_duration_sec / alignment_duration;
+                        
+                        // Clamp scale to reasonable values (0.5x to 2.0x) to avoid extreme distortions
+                        let scale_clamped = scale.clamp(0.5, 2.0);
+                        
+                        // Only apply if correction is significant (>0.5%)
+                        if (scale_clamped - 1.0).abs() > 0.005 {
+                            tracing::debug!(
+                                alignment_duration = alignment_duration,
+                                audio_duration = audio_duration_sec,
+                                scale = scale_clamped,
+                                "Normalizing batch alignments to match audio duration"
+                            );
+                            
+                            // Apply scaling to all timestamps
+                            for align in &mut batch_alignments {
+                                align.start_sec *= scale_clamped;
+                                align.end_sec *= scale_clamped;
+                            }
+                            
+                            // Log final accuracy
+                            let final_alignment_duration = batch_alignments.last().unwrap().end_sec;
+                            let diff_ms = ((final_alignment_duration - audio_duration_sec) * 1000.0).abs();
+                            if diff_ms > 10.0 {
+                                tracing::warn!(
+                                    final_alignment_duration = final_alignment_duration,
+                                    audio_duration = audio_duration_sec,
+                                    diff_ms = diff_ms,
+                                    "Alignment vs audio duration still off after normalization"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    final_alignment_duration = final_alignment_duration,
+                                    audio_duration = audio_duration_sec,
+                                    "Batch alignment normalization successful"
+                                );
+                            }
+                        }
+                    }
+                }
+                
                 Ok(Some((batch_audio, batch_alignments)))
             }
         }
@@ -486,8 +548,8 @@ impl TTSKoko {
                     break;
                 }
             }
-            tracing::debug!("Alignment: rescaled per-item token counts from {} to {} to match durations length {}.", sum_counts, adjusted_counts.iter().sum::<usize>(), target_len);
-            sum_counts = adjusted_counts.iter().sum();
+            let new_sum = adjusted_counts.iter().sum::<usize>();
+            tracing::debug!("Alignment: rescaled per-item token counts from {} to {} to match durations length {}.", sum_counts, new_sum, target_len);
         }
 
         // 5) Build the word_map by assigning contiguous spans across the token stream.

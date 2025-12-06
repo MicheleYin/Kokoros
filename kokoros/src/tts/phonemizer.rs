@@ -5,8 +5,6 @@ use espeak_rs::text_to_phonemes;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::path::PathBuf;
-#[cfg(feature = "espeak")]
-use std::sync::Mutex;
 use voirs_g2p::backends::rule_based::RuleBasedG2p;
 use voirs_g2p::{G2p, LanguageCode};
 use futures::executor::block_on;

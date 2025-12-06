@@ -4,7 +4,8 @@ use kokoros::tts::phonemizer::{BackendType, Phonemizer};
 fn main() {
     // Enable debug logging
     std::env::set_var("RUST_LOG", "debug");
-    env_logger::init();
+    // Note: env_logger is optional - remove this line if the crate is not available
+    // env_logger::init();
     
     println!("=== Debugging RuleBasedG2p Output ===\n");
     

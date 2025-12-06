@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use ndarray::{ArrayBase, IxDyn, OwnedRepr};
 use ort::{
-    session::{Session, SessionInputValue, SessionInputs, SessionOutputs},
+    session::{Session, SessionInputValue, SessionInputs},
     value::{Tensor, Value},
 };
 use model_schema::v1_0_timestamped::DURATIONS;
