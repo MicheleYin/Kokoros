@@ -15,7 +15,7 @@ mod model_schema {
     pub const SPEED: &str = "speed";
 
     pub mod v1_0 {
-        pub const TOKENS: &str = "tokens";
+        pub const TOKENS: &str = "input_ids";  // Changed from "tokens" to "input_ids"
         pub const AUDIO: &str = "audio";
     }
 
@@ -128,13 +128,26 @@ impl OrtKoko {
             ModelStrategy::Standard(sess) => {
                 let outputs = sess.run(SessionInputs::from(inputs))?;
 
-                let (shape, data) = outputs[audio_key]
-                    .try_extract_tensor::<f32>()
-                    .or_else(|_| outputs["waveforms"].try_extract_tensor::<f32>())
-                    .map_err(|_| "Standard Model: Could not find 'audio' output")?;
+                // Try multiple output name variations - use get() to avoid panicking
+                let output_names = vec![audio_key, "waveform", "waveforms", "audio"];
+                let mut result: Option<(ndarray::IxDyn, Vec<f32>)> = None;
+                
+                for name in &output_names {
+                    if let Some(output) = outputs.get(*name) {
+                        if let Ok((shape, data)) = output.try_extract_tensor::<f32>() {
+                            let shape_vec: Vec<usize> = shape.iter().map(|&i| i as usize).collect();
+                            result = Some((ndarray::IxDyn(&shape_vec), data.to_vec()));
+                            break;
+                        }
+                    }
+                }
+                
+                let (shape, data) = result.ok_or_else(|| {
+                    let available: Vec<String> = outputs.keys().map(|k| k.to_string()).collect();
+                    format!("Standard Model: Could not find audio output. Tried: {:?}, Available: {:?}", output_names, available)
+                })?;
 
-                let shape_vec: Vec<usize> = shape.into_iter().map(|&i| i as usize).collect();
-                let audio_array = ArrayBase::from_shape_vec(shape_vec, data.to_vec())?;
+                let audio_array = ArrayBase::from_shape_vec(shape, data)?;
 
                 Ok((audio_array, None))
             }
