@@ -242,12 +242,12 @@ impl TTSKoko {
                 // Standard mel-spectrogram frame rates are typically 30-200 Hz
                 // Some models may use lower rates, so we allow 30+ Hz
                 // The calculated rate ensures durations match the actual audio length
-                let frames_per_sec: f32 = if calculated_frame_rate >= 30.0 && calculated_frame_rate <= 200.0 {
+                let frames_per_sec: f32 = if calculated_frame_rate >= 25.0 && calculated_frame_rate <= 200.0 {
                     calculated_frame_rate
                 } else {
                     // Fall back to standard 80 Hz if calculated rate is unreasonable
                     tracing::warn!(
-                        "{} {}Calculated frame rate {:.2} Hz is outside reasonable range (30-200 Hz), using 80 Hz",
+                        "{} {}Calculated frame rate {:.2} Hz is outside reasonable range (25-200 Hz), using 80 Hz",
                         debug_prefix, chunk_info, calculated_frame_rate
                     );
                     80.0
