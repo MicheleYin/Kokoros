@@ -86,8 +86,7 @@ enum Mode {
 #[command(version = "0.1")]
 #[command(author = "Lucas Jin")]
 struct Cli {
-    /// A language identifier from
-    /// https://github.com/espeak-ng/espeak-ng/blob/master/docs/languages.md
+    /// A language identifier (e.g., "a" for en-us, "b" for en-gb)
     #[arg(
         short = 'l',
         long = "lan",

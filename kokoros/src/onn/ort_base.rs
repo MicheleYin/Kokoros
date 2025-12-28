@@ -1,6 +1,6 @@
 #[cfg(feature = "cuda")]
-use ort::execution_providers::cuda::CUDAExecutionProvider;
-use ort::execution_providers::cpu::CPUExecutionProvider;
+use ort::ep::cuda::CUDA as CUDAExecutionProvider;
+use ort::ep::CPU as CPUExecutionProvider;
 use ort::session::builder::SessionBuilder;
 use ort::session::Session;
 use ort::logging::LogLevel;

@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-// Note: espeak is now handled through the Phonemizer, which manages its own mutex
+// Phonemizer handles G2P conversion using piper-tts-rust (mini-bart-g2p)
 
 /// Helper function to phonemize text using the phonemizer (with fallback)
 fn phonemize_text(text: &str, lang: &str) -> String {
@@ -169,7 +169,7 @@ impl TTSKoko {
             let (mut tokens, word_map) = if use_alignment {
                 self.tokenize_with_alignment(chunk, lan)
             } else {
-                // Fast path for audio-only models: single eSpeak pass, no per-item calls
+                // Fast path for audio-only models: single phonemization pass, no per-item calls
                 self.tokenize_full_no_alignment(chunk, lan)
             };
 
@@ -420,7 +420,7 @@ impl TTSKoko {
         // We will produce tokens from the full, context-aware phonemes (best prosody)
         // and build an alignment map by estimating per-word token spans using
         // per-word phoneme tokenization. This keeps audio natural while providing
-        // robust timestamps even when eSpeak merges words (e.g., "the model").
+        // robust timestamps even when the phonemizer merges words (e.g., "the model").
 
         // 1) Full-phrase phonemes and tokens (prosody source)
         let full_phonemes = phonemize_text(text, lan);
