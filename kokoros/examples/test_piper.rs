@@ -1,18 +1,11 @@
-// Simple test to verify piper-tts-rust backend loads and works
-use kokoros::tts::phonemizer::{BackendType, Phonemizer};
-use std::path::PathBuf;
+// Simple test to verify Espeak backend loads and works
+use kokoros::tts::phonemizer::Phonemizer;
 
 fn main() {
-    println!("Testing piper-tts-rust backend loading...\n");
+    println!("Testing Espeak backend loading...\n");
     
-    // Get model path from command line or use default
-    let model_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from("../../mini-bart-g2p")));
-    
-    println!("Creating Phonemizer with piper-tts-rust backend...");
-    let phonemizer = Phonemizer::new_with_backend("a", BackendType::PiperTtsRust, model_path);
+    println!("Creating Phonemizer with Espeak backend...");
+    let phonemizer = Phonemizer::new("a");
     
     println!("Backend type: {:?}", phonemizer.backend_type());
     println!("\nTesting phonemization:\n");
@@ -23,7 +16,7 @@ fn main() {
         let result = phonemizer.phonemize(word, false);
         match result.as_str() {
             "" => {
-                println!("  '{}' -> (EMPTY - model may not be loaded!)", word);
+                println!("  '{}' -> (EMPTY - backend may not be working!)", word);
             }
             s => {
                 println!("  '{}' -> '{}'", word, s);
@@ -32,10 +25,10 @@ fn main() {
     }
     
     if phonemizer.phonemize("hello", false).is_empty() {
-        println!("\n⚠ WARNING: Model appears to not be loaded or working!");
-        println!("   Check that model files exist at the specified path.");
+        println!("\n⚠ WARNING: Espeak backend appears to not be working!");
+        println!("   Check that espeak-rs is properly initialized.");
     } else {
-        println!("\n✓ Model appears to be working!");
+        println!("\n✓ Espeak backend appears to be working!");
     }
 }
 

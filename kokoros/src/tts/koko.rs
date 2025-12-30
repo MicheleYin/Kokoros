@@ -12,12 +12,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-// Phonemizer handles G2P conversion using piper-tts-rust (mini-bart-g2p)
+// Phonemizer handles G2P conversion using espeak-rs (piper-rs espeak-rs crate)
 
-/// Helper function to phonemize text using the phonemizer (with fallback)
-fn phonemize_text(text: &str, lang: &str) -> String {
-    let phonemizer = Phonemizer::new(lang);
-    phonemizer.phonemize(text, true) // normalize = true
+/// Helper function to phonemize text using a shared phonemizer
+fn phonemize_text(phonemizer: &Arc<Mutex<Phonemizer>>, text: &str, _lang: &str) -> String {
+    let phonemizer_guard = phonemizer.lock().unwrap();
+    phonemizer_guard.phonemize(text, true) // normalize = true
 }
 
 // Flag to ensure voice styles are only logged once
@@ -72,6 +72,7 @@ pub struct TTSKoko {
     model: Arc<Mutex<ort_koko::OrtKoko>>,
     styles: HashMap<String, Vec<[[f32; 256]; 1]>>,
     init_config: InitConfig,
+    phonemizer: Arc<Mutex<Phonemizer>>,
 }
 
 /// Parallel TTS with multiple ONNX instances for true concurrency
@@ -82,6 +83,7 @@ pub struct TTSKokoParallel {
     models: Vec<Arc<Mutex<ort_koko::OrtKoko>>>,
     styles: HashMap<String, Vec<[[f32; 256]; 1]>>,
     init_config: InitConfig,
+    phonemizer: Arc<Mutex<Phonemizer>>,
 }
 
 #[derive(Clone)]
@@ -128,11 +130,17 @@ impl TTSKoko {
 
         let styles = Self::load_voices(voices_path);
 
+        // Initialize shared phonemizer (loaded once per engine)
+        // Uses Espeak backend by default (espeak-ng command line tool)
+        // Phonemizer::new() automatically selects the ByT5 backend and finds the model in common locations
+        let phonemizer = Arc::new(Mutex::new(Phonemizer::new("en")));
+
         TTSKoko {
             model_path: model_path.to_string(),
             model,
             styles,
             init_config: cfg,
+            phonemizer,
         }
     }
 
@@ -423,7 +431,7 @@ impl TTSKoko {
         // robust timestamps even when the phonemizer merges words (e.g., "the model").
 
         // 1) Full-phrase phonemes and tokens (prosody source)
-        let full_phonemes = phonemize_text(text, lan);
+        let full_phonemes = phonemize_text(&self.phonemizer, text, lan);
         let all_tokens = tokenize(&full_phonemes);
 
         // 2) Build a tokenization plan per original "word or punctuation" unit.
@@ -507,7 +515,7 @@ impl TTSKoko {
                 per_item_token_counts.push(0);
                 per_item_is_punct.push(true);
             } else {
-                let ph = phonemize_text(it, lan);
+                let ph = phonemize_text(&self.phonemizer, it, lan);
                 let cnt = tokenize(&ph).len();
                 per_item_token_counts.push(cnt);
                 per_item_is_punct.push(false);
@@ -518,7 +526,7 @@ impl TTSKoko {
         //    If sums differ (likely due to coarticulation/context differences),
         //    rescale the counts to match the full length, keeping the distribution similar.
         let target_len = all_tokens.len();
-        let mut sum_counts: usize = per_item_token_counts.iter().sum();
+        let sum_counts: usize = per_item_token_counts.iter().sum();
 
         let mut adjusted_counts: Vec<usize> = per_item_token_counts.clone();
         if sum_counts != target_len && sum_counts > 0 {
@@ -590,7 +598,7 @@ impl TTSKoko {
     /// Fast tokenization path for audio-only models (no timestamps)
     /// Performs a single phonemization for the full text and returns tokens with an empty word map.
     fn tokenize_full_no_alignment(&self, text: &str, lan: &str) -> (Vec<i64>, Vec<(String, usize, usize)>) {
-        let full_phonemes = phonemize_text(text, lan);
+        let full_phonemes = phonemize_text(&self.phonemizer, text, lan);
         let all_tokens = tokenize(&full_phonemes);
         (all_tokens, Vec::new())
     }
@@ -611,7 +619,7 @@ impl TTSKoko {
             let sentence = format!("{}.", sentence.trim());
 
             // Convert to phonemes to check token count
-            let sentence_phonemes = phonemize_text(&sentence, "en");
+            let sentence_phonemes = phonemize_text(&self.phonemizer, &sentence, "en");
             let token_count = tokenize(&sentence_phonemes).len();
 
             if token_count > max_tokens {
@@ -626,7 +634,7 @@ impl TTSKoko {
                         format!("{} {}", word_chunk, word)
                     };
 
-                    let test_phonemes = phonemize_text(&test_chunk, "en");
+                    let test_phonemes = phonemize_text(&self.phonemizer, &test_chunk, "en");
                     let test_tokens = tokenize(&test_phonemes).len();
 
                     if test_tokens > max_tokens {
@@ -645,7 +653,7 @@ impl TTSKoko {
             } else if !current_chunk.is_empty() {
                 // Try to append to current chunk
                 let test_text = format!("{} {}", current_chunk, sentence);
-                let test_phonemes = phonemize_text(&test_text, "en");
+                let test_phonemes = phonemize_text(&self.phonemizer, &test_text, "en");
                 let test_tokens = tokenize(&test_phonemes).len();
 
                 if test_tokens > max_tokens {
@@ -1152,11 +1160,17 @@ impl TTSKokoParallel {
 
         let styles = TTSKoko::load_voices(voices_path);
 
+        // Initialize shared phonemizer (loaded once per engine)
+        // Uses Espeak backend by default (espeak-ng command line tool)
+        // Phonemizer::new() automatically selects the ByT5 backend and finds the model in common locations
+        let phonemizer = Arc::new(Mutex::new(Phonemizer::new("en")));
+
         TTSKokoParallel {
             model_path: model_path.to_string(),
             models,
             styles,
             init_config: cfg,
+            phonemizer,
         }
     }
 
@@ -1174,6 +1188,7 @@ impl TTSKokoParallel {
             // TODO: This clones the HashMap. In a future PR, wrap styles in Arc<>!
             styles: self.styles.clone(),
             init_config: self.init_config.clone(),
+            phonemizer: Arc::clone(&self.phonemizer),
         }
     }
 
@@ -1225,6 +1240,7 @@ impl TTSKokoParallel {
             model: Arc::clone(&self.models[0]), // Just for interface compatibility
             styles: self.styles.clone(),
             init_config: self.init_config.clone(),
+            phonemizer: Arc::clone(&self.phonemizer),
         };
         temp_tts.split_text_into_speech_chunks(text, max_words)
     }

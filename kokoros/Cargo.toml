@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-piper-tts-rust = { path = "../../piper-tts-rust" }
+espeak-rs = "0.1.9"
 hound = "3.5.1"
 indicatif = "0.17.11"
 ndarray = "0.16.1"
@@ -22,8 +22,8 @@ opus = "0.3"
 ogg = "0.9"
 
 # Base ONNX Runtime configuration
-# Use local ort version for iOS support (crates.io version doesn't have pre-built iOS binaries)
-ort = { path = "../../ort", default-features = true }
+# Use official ort from crates.io
+ort = { version = "2.0.0-rc.10", default-features = true }
 
 [features]
 default = ["cpu"]
