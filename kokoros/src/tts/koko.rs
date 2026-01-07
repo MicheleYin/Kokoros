@@ -1,6 +1,6 @@
 use crate::onn::ort_koko::{self, ModelStrategy};
-use crate::tts::tokenize::tokenize;
 use crate::tts::phonemizer::Phonemizer;
+use crate::tts::tokenize::tokenize;
 use crate::utils;
 use crate::utils::debug::format_debug_prefix;
 use ndarray::Array3;
@@ -12,12 +12,20 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-// Phonemizer handles G2P conversion using espeak-rs (piper-rs espeak-rs crate)
+// Phonemizer handles G2P conversion using ONNX models (mini-bart-g2p)
 
 /// Helper function to phonemize text using a shared phonemizer
 fn phonemize_text(phonemizer: &Arc<Mutex<Phonemizer>>, text: &str, _lang: &str) -> String {
-    let phonemizer_guard = phonemizer.lock().unwrap();
-    phonemizer_guard.phonemize(text, true) // normalize = true
+    match phonemizer.lock() {
+        Ok(phonemizer_guard) => {
+            phonemizer_guard.phonemize(text, true) // normalize = true
+        }
+        Err(e) => {
+            tracing::error!("Failed to lock phonemizer (mutex poisoned): {:?}", e);
+            // Return empty string as fallback
+            String::new()
+        }
+    }
 }
 
 // Flag to ensure voice styles are only logged once
@@ -42,7 +50,7 @@ impl TtsOutput {
     pub fn raw_output(self) -> (Vec<f32>, Option<Vec<WordAlignment>>) {
         match self {
             TtsOutput::Audio(a) => (a, None),
-            TtsOutput::Aligned(a, b) => (a, Some(b))
+            TtsOutput::Aligned(a, b) => (a, Some(b)),
         }
     }
 }
@@ -130,10 +138,26 @@ impl TTSKoko {
 
         let styles = Self::load_voices(voices_path);
 
-        // Initialize shared phonemizer (loaded once per engine)
-        // Uses Espeak backend by default (espeak-ng command line tool)
-        // Phonemizer::new() automatically selects the ByT5 backend and finds the model in common locations
-        let phonemizer = Arc::new(Mutex::new(Phonemizer::new("en")));
+        // Initialize phonemizer (loaded once per TTSKoko instance)
+        // Uses ONNX backend with mini-bart-g2p model
+        // Phonemizer::new() automatically finds the model in common locations
+        // Note: For parallel processing, use TTSKokoParallel which shares a single phonemizer across instances
+        tracing::info!(
+            "Initializing phonemizer for single TTSKoko instance (ONNX backend with mini-bart-g2p)..."
+        );
+        let phonemizer = match Phonemizer::new("en") {
+            Ok(p) => {
+                tracing::info!("✓ Phonemizer initialized successfully");
+                Arc::new(Mutex::new(p))
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize phonemizer: {}", e);
+                panic!(
+                    "Failed to initialize phonemizer: {}. Make sure mini-bart-g2p model files are in resources.",
+                    e
+                );
+            }
+        };
 
         TTSKoko {
             model_path: model_path.to_string(),
@@ -156,14 +180,14 @@ impl TTSKoko {
         chunk_number_start: Option<usize>,
         mut mode: ExecutionMode,
     ) -> Result<Option<(Vec<f32>, Vec<WordAlignment>)>, Box<dyn std::error::Error>> {
-
         let chunks = self.split_text_into_chunks(txt, 500);
         let start_chunk_num = chunk_number_start.unwrap_or(0);
 
         let debug_prefix = format_debug_prefix(request_id, instance_id);
 
-        let process_one_chunk = |chunk: &str, chunk_num: usize| -> Result<TtsOutput, Box<dyn std::error::Error>> {
-
+        let process_one_chunk = |chunk: &str,
+                                 chunk_num: usize|
+         -> Result<TtsOutput, Box<dyn std::error::Error>> {
             let chunk_info = format!("Chunk: {}, ", chunk_num);
             tracing::debug!("{} {}text: '{}'", debug_prefix, chunk_info, chunk);
 
@@ -182,7 +206,22 @@ impl TTSKoko {
             };
 
             // Log token count (helpful for debugging context limits)
-            tracing::debug!("{} {}tokens generated: {}", debug_prefix, chunk_info, tokens.len());
+            tracing::debug!(
+                "{} {}tokens generated: {}",
+                debug_prefix,
+                chunk_info,
+                tokens.len()
+            );
+
+            // Validate tokens before proceeding
+            if tokens.is_empty() {
+                let error_msg = format!(
+                    "{} {}No tokens generated for chunk: '{}'. This usually means the phonemizer model failed to load or returned empty results.",
+                    debug_prefix, chunk_info, chunk
+                );
+                tracing::error!("{}", error_msg);
+                return Err(error_msg.into());
+            }
 
             // B. Silence
             let silence_count = initial_silence.unwrap_or(0);
@@ -250,20 +289,28 @@ impl TTSKoko {
                 // Standard mel-spectrogram frame rates are typically 30-200 Hz
                 // Some models may use lower rates, so we allow 30+ Hz
                 // The calculated rate ensures durations match the actual audio length
-                let frames_per_sec: f32 = if calculated_frame_rate >= 25.0 && calculated_frame_rate <= 200.0 {
+                let frames_per_sec: f32 = if calculated_frame_rate >= 25.0
+                    && calculated_frame_rate <= 200.0
+                {
                     calculated_frame_rate
                 } else {
                     // Fall back to standard 80 Hz if calculated rate is unreasonable
                     tracing::warn!(
                         "{} {}Calculated frame rate {:.2} Hz is outside reasonable range (25-200 Hz), using 80 Hz",
-                        debug_prefix, chunk_info, calculated_frame_rate
+                        debug_prefix,
+                        chunk_info,
+                        calculated_frame_rate
                     );
                     80.0
                 };
 
                 tracing::debug!(
                     "{} {}Using frame rate: {:.2} Hz (word_frames={:.2}, audio_sec={:.3})",
-                    debug_prefix, chunk_info, frames_per_sec, total_word_frames, audio_duration_sec
+                    debug_prefix,
+                    chunk_info,
+                    frames_per_sec,
+                    total_word_frames,
+                    audio_duration_sec
                 );
 
                 // Guard speed to avoid division by zero; timestamps should reflect the final render timeline.
@@ -286,9 +333,9 @@ impl TTSKoko {
                 let punct_pause_s = |label: &str| -> f32 {
                     match label {
                         "." | "!" | "?" => 0.300, // 300 ms
-                        ","                 => 0.150, // 150 ms
-                        ";" | ":"           => 0.200,
-                        _                    => 0.0,
+                        "," => 0.150,             // 150 ms
+                        ";" | ":" => 0.200,
+                        _ => 0.0,
                     }
                 };
 
@@ -304,7 +351,11 @@ impl TTSKoko {
                         let pause_frames = pause_s * frames_per_sec;
                         let start_sec = chunk_time_cursor / frames_per_sec;
                         let end_sec = (chunk_time_cursor + pause_frames) / frames_per_sec;
-                        alignments.push(WordAlignment { word: word.clone(), start_sec, end_sec });
+                        alignments.push(WordAlignment {
+                            word: word.clone(),
+                            start_sec,
+                            end_sec,
+                        });
                         chunk_time_cursor += pause_frames;
                         continue;
                     }
@@ -369,19 +420,19 @@ impl TTSKoko {
                         }
                     }
                 }
-                
+
                 // Normalize alignments to match actual audio duration
                 // This ensures accuracy when model-predicted durations don't perfectly match generated audio
                 if !batch_alignments.is_empty() && !batch_audio.is_empty() {
                     let audio_duration_sec = batch_audio.len() as f32 / sample_rate;
                     let alignment_duration = batch_alignments.last().unwrap().end_sec;
-                    
+
                     if alignment_duration > 0.0 && audio_duration_sec > 0.0 {
                         let scale = audio_duration_sec / alignment_duration;
-                        
+
                         // Clamp scale to reasonable values (0.5x to 2.0x) to avoid extreme distortions
                         let scale_clamped = scale.clamp(0.5, 2.0);
-                        
+
                         // Only apply if correction is significant (>0.5%)
                         if (scale_clamped - 1.0).abs() > 0.005 {
                             tracing::debug!(
@@ -390,16 +441,17 @@ impl TTSKoko {
                                 scale = scale_clamped,
                                 "Normalizing batch alignments to match audio duration"
                             );
-                            
+
                             // Apply scaling to all timestamps
                             for align in &mut batch_alignments {
                                 align.start_sec *= scale_clamped;
                                 align.end_sec *= scale_clamped;
                             }
-                            
+
                             // Log final accuracy
                             let final_alignment_duration = batch_alignments.last().unwrap().end_sec;
-                            let diff_ms = ((final_alignment_duration - audio_duration_sec) * 1000.0).abs();
+                            let diff_ms =
+                                ((final_alignment_duration - audio_duration_sec) * 1000.0).abs();
                             if diff_ms > 10.0 {
                                 tracing::warn!(
                                     final_alignment_duration = final_alignment_duration,
@@ -417,14 +469,18 @@ impl TTSKoko {
                         }
                     }
                 }
-                
+
                 Ok(Some((batch_audio, batch_alignments)))
             }
         }
     }
 
     /// Prosody-Aware Tokenization ---
-    fn tokenize_with_alignment(&self, text: &str, lan: &str) -> (Vec<i64>, Vec<(String, usize, usize)>) {
+    fn tokenize_with_alignment(
+        &self,
+        text: &str,
+        lan: &str,
+    ) -> (Vec<i64>, Vec<(String, usize, usize)>) {
         // We will produce tokens from the full, context-aware phonemes (best prosody)
         // and build an alignment map by estimating per-word token spans using
         // per-word phoneme tokenization. This keeps audio natural while providing
@@ -443,11 +499,11 @@ impl TTSKoko {
             for raw in s.split_whitespace() {
                 let chars: Vec<char> = raw.chars().collect();
                 let chars_len = chars.len();
-                
+
                 if chars_len == 0 {
                     continue;
                 }
-                
+
                 let mut start = 0usize;
                 // Initialize end to chars_len, but ensure it never exceeds it
                 let mut end = chars_len.min(chars_len);
@@ -547,7 +603,9 @@ impl TTSKoko {
             let mut remaining = target_len.saturating_sub(new_sum);
             fractional.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             for (i, _) in fractional {
-                if remaining == 0 { break; }
+                if remaining == 0 {
+                    break;
+                }
                 // Bounds check before accessing adjusted_counts
                 if i < adjusted_counts.len() {
                     adjusted_counts[i] += 1;
@@ -557,7 +615,12 @@ impl TTSKoko {
                 }
             }
             let new_sum = adjusted_counts.iter().sum::<usize>();
-            tracing::debug!("Alignment: rescaled per-item token counts from {} to {} to match durations length {}.", sum_counts, new_sum, target_len);
+            tracing::debug!(
+                "Alignment: rescaled per-item token counts from {} to {} to match durations length {}.",
+                sum_counts,
+                new_sum,
+                target_len
+            );
         }
 
         // 5) Build the word_map by assigning contiguous spans across the token stream.
@@ -580,9 +643,10 @@ impl TTSKoko {
 
         // If our mapping under-ran due to rounding issues, extend the last non-punct item to cover all tokens
         if cursor < target_len {
-            if let Some(last_non_punct_pos) = (0..word_map.len()).rev().find(|&i| {
-                per_item_is_punct.get(i).copied().unwrap_or(false) == false
-            }) {
+            if let Some(last_non_punct_pos) = (0..word_map.len())
+                .rev()
+                .find(|&i| per_item_is_punct.get(i).copied().unwrap_or(false) == false)
+            {
                 if last_non_punct_pos < word_map.len() {
                     if let Some((w, s, _e)) = word_map.get(last_non_punct_pos) {
                         word_map[last_non_punct_pos] = (w.clone(), *s, target_len);
@@ -597,9 +661,28 @@ impl TTSKoko {
 
     /// Fast tokenization path for audio-only models (no timestamps)
     /// Performs a single phonemization for the full text and returns tokens with an empty word map.
-    fn tokenize_full_no_alignment(&self, text: &str, lan: &str) -> (Vec<i64>, Vec<(String, usize, usize)>) {
+    fn tokenize_full_no_alignment(
+        &self,
+        text: &str,
+        lan: &str,
+    ) -> (Vec<i64>, Vec<(String, usize, usize)>) {
         let full_phonemes = phonemize_text(&self.phonemizer, text, lan);
+        if full_phonemes.is_empty() {
+            tracing::error!(
+                "Phonemizer returned empty phonemes for text: '{}'. This usually means the model failed to load.",
+                text
+            );
+            // Return empty tokens - the caller should handle this gracefully
+            return (Vec::new(), Vec::new());
+        }
         let all_tokens = tokenize(&full_phonemes);
+        if all_tokens.is_empty() {
+            tracing::warn!(
+                "Tokenization produced no tokens for phonemes: '{}' (text: '{}')",
+                full_phonemes,
+                text
+            );
+        }
         (all_tokens, Vec::new())
     }
 
@@ -810,7 +893,7 @@ impl TTSKoko {
             request_id,
             instance_id,
             chunk_number,
-            ExecutionMode::Batch
+            ExecutionMode::Batch,
         )
     }
 
@@ -891,7 +974,7 @@ impl TTSKoko {
         mut chunk_callback: F,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
-    // CHANGE: Callback accepts TtsOutput instead of just Vec<f32>
+        // CHANGE: Callback accepts TtsOutput instead of just Vec<f32>
         F: FnMut((Vec<f32>, Vec<WordAlignment>)) -> Result<(), Box<dyn std::error::Error>>,
     {
         let mut adapter = |output: TtsOutput| -> Result<(), Box<dyn std::error::Error>> {
@@ -1160,10 +1243,29 @@ impl TTSKokoParallel {
 
         let styles = TTSKoko::load_voices(voices_path);
 
-        // Initialize shared phonemizer (loaded once per engine)
-        // Uses Espeak backend by default (espeak-ng command line tool)
-        // Phonemizer::new() automatically selects the ByT5 backend and finds the model in common locations
-        let phonemizer = Arc::new(Mutex::new(Phonemizer::new("en")));
+        // Initialize shared phonemizer (loaded ONCE per TTSKokoParallel engine, shared across all instances)
+        // Uses ONNX backend with mini-bart-g2p model
+        // Phonemizer::new() automatically finds the model in common locations
+        // This phonemizer will be shared across all num_instances model instances via Arc::clone
+        tracing::info!(
+            "Initializing shared phonemizer (will be reused across {} model instances)...",
+            num_instances
+        );
+        let phonemizer = match Phonemizer::new("en") {
+            Ok(p) => {
+                tracing::info!(
+                    "✓ Shared phonemizer initialized successfully (ONNX backend with mini-bart-g2p)"
+                );
+                Arc::new(Mutex::new(p))
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize phonemizer: {}", e);
+                panic!(
+                    "Failed to initialize phonemizer: {}. Make sure mini-bart-g2p model files are in resources.",
+                    e
+                );
+            }
+        };
 
         TTSKokoParallel {
             model_path: model_path.to_string(),
@@ -1180,7 +1282,8 @@ impl TTSKokoParallel {
         Arc::clone(&self.models[index])
     }
 
-    /// HELPER: Create a lightweight wrapper for a specific model ---
+    /// HELPER: Create a lightweight wrapper for a specific model
+    /// The phonemizer is shared across all instances via Arc::clone (no re-initialization)
     fn get_tts_wrapper(&self, model_instance: Arc<Mutex<ort_koko::OrtKoko>>) -> TTSKoko {
         TTSKoko {
             model_path: self.model_path.clone(),
@@ -1188,6 +1291,7 @@ impl TTSKokoParallel {
             // TODO: This clones the HashMap. In a future PR, wrap styles in Arc<>!
             styles: self.styles.clone(),
             init_config: self.init_config.clone(),
+            // Share the same phonemizer instance across all model instances (no re-initialization)
             phonemizer: Arc::clone(&self.phonemizer),
         }
     }
@@ -1207,7 +1311,14 @@ impl TTSKokoParallel {
     ) -> Result<Option<(Vec<f32>, Vec<WordAlignment>)>, Box<dyn Error>> {
         let wrapper = self.get_tts_wrapper(model_instance);
         wrapper.tts_timestamped_raw_audio(
-            text, language, style_name, speed, initial_silence, request_id, instance_id, chunk_number
+            text,
+            language,
+            style_name,
+            speed,
+            initial_silence,
+            request_id,
+            instance_id,
+            chunk_number,
         )
     }
 
@@ -1227,8 +1338,14 @@ impl TTSKokoParallel {
         let wrapper = self.get_tts_wrapper(model_instance);
 
         wrapper.tts_raw_audio(
-            text, language, style_name, speed,
-            initial_silence, request_id, instance_id, chunk_number
+            text,
+            language,
+            style_name,
+            speed,
+            initial_silence,
+            request_id,
+            instance_id,
+            chunk_number,
         )
     }
 
