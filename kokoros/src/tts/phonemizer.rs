@@ -201,11 +201,12 @@ impl OnnxBackend {
                 // Check if it's punctuation
                 let part = parts[i];
                 if part.len() == 1 {
-                    let c = part.chars().next().unwrap();
-                    if ".,!?:;".contains(c) {
-                        result.push(c);
-                        i += 1;
-                        continue;
+                    if let Some(c) = part.chars().next() {
+                        if ".,!?:;".contains(c) {
+                            result.push(c);
+                            i += 1;
+                            continue;
+                        }
                     }
                 }
 
@@ -339,15 +340,42 @@ impl OnnxBackend {
                 }
             };
 
-            // Process text - if this panics, the mutex will be poisoned
-            // but we can't prevent that here. The caller should handle panics at a higher level.
-            match pg.process_text(&normalized_text) {
-                Ok(arpabet_string) => {
+            // Wrap process_text in catch_unwind to prevent panics from poisoning the mutex
+            // In production builds with aggressive optimizations, ONNX Runtime calls can cause
+            // stack overflow panics. By catching the panic here, we prevent mutex poisoning
+            // and allow subsequent calls to continue working.
+            let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pg.process_text(&normalized_text)
+            }));
+
+            match process_result {
+                Ok(Ok(arpabet_string)) => {
                     tracing::debug!("ARPAbet output for '{}': '{}'", text, arpabet_string);
                     arpabet_string
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::warn!("Failed to phonemize text '{}': {:?}", text, e);
+                    return None;
+                }
+                Err(panic_payload) => {
+                    // Extract panic message if possible
+                    let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                        format!("{}", s)
+                    } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+
+                    tracing::error!(
+                        "Panic occurred during phonemization for text '{}': {}. \
+                        This is often caused by 'No tokens generated' errors in piper-tts-rust \
+                        (common with short/abbreviated text like 'O.', 'C.', etc.) or stack overflow \
+                        in production builds with aggressive optimizations. \
+                        Mutex was NOT poisoned due to catch_unwind protection - processing can continue.",
+                        text,
+                        panic_msg
+                    );
                     return None;
                 }
             }
@@ -548,8 +576,15 @@ impl Phonemizer {
             return String::new();
         }
 
+        // Wrap normalization in catch_unwind to prevent panics from crashing the app
         let text = if normalize {
-            normalize::normalize_text(text)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                normalize::normalize_text(text)
+            }))
+            .unwrap_or_else(|_| {
+                tracing::error!("Panic occurred during text normalization, using original text");
+                text.to_string()
+            })
         } else {
             text.to_string()
         };

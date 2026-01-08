@@ -32,84 +32,118 @@ lazy_static! {
 }
 
 pub fn normalize_text(text: &str) -> String {
-    let mut text = text.to_string();
+    // Use catch_unwind to prevent panics from propagating - return original text if normalization panics
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut text = text.to_string();
 
-    // Replace special quotes and brackets
-    text = text.replace('\u{2018}', "'").replace('\u{2019}', "'");
-    text = text.replace('«', "\u{201C}").replace('»', "\u{201D}");
-    text = text.replace('\u{201C}', "\"").replace('\u{201D}', "\"");
-    text = text.replace('(', "«").replace(')', "»");
+        // Replace special quotes and brackets
+        text = text.replace('\u{2018}', "'").replace('\u{2019}', "'");
+        text = text.replace('«', "\u{201C}").replace('»', "\u{201D}");
+        text = text.replace('\u{201C}', "\"").replace('\u{201D}', "\"");
+        text = text.replace('(', "«").replace(')', "»");
 
-    // Replace Chinese/Japanese punctuation
-    let from_chars = ['、', '。', '！', '，', '：', '；', '？'];
-    let to_chars = [',', '.', '!', ',', ':', ';', '?'];
+        // Replace Chinese/Japanese punctuation
+        let from_chars = ['、', '。', '！', '，', '：', '；', '？'];
+        let to_chars = [',', '.', '!', ',', ':', ';', '?'];
 
-    for (from, to) in from_chars.iter().zip(to_chars.iter()) {
-        text = text.replace(*from, &format!("{} ", to));
-    }
+        for (from, to) in from_chars.iter().zip(to_chars.iter()) {
+            text = text.replace(*from, &format!("{} ", to));
+        }
 
-    // Apply regex replacements
-    text = WHITESPACE_RE.replace_all(&text, " ").to_string();
-    text = MULTI_SPACE_RE.replace_all(&text, " ").to_string();
-    text = NEWLINE_SPACE_RE.replace_all(&text, "").to_string();
-    text = DOCTOR_RE.replace_all(&text, "Doctor").to_string();
-    text = MISTER_RE.replace_all(&text, "Mister").to_string();
-    text = MISS_RE.replace_all(&text, "Miss").to_string();
-    text = MRS_RE.replace_all(&text, "Mrs").to_string();
-    text = ETC_RE.replace_all(&text, "etc").to_string();
-    text = YEAH_RE.replace_all(&text, "${1}e'a").to_string();
+        // Apply regex replacements
+        text = WHITESPACE_RE.replace_all(&text, " ").to_string();
+        text = MULTI_SPACE_RE.replace_all(&text, " ").to_string();
+        text = NEWLINE_SPACE_RE.replace_all(&text, "").to_string();
+        text = DOCTOR_RE.replace_all(&text, "Doctor").to_string();
+        text = MISTER_RE.replace_all(&text, "Mister").to_string();
+        text = MISS_RE.replace_all(&text, "Miss").to_string();
+        text = MRS_RE.replace_all(&text, "Mrs").to_string();
+        text = ETC_RE.replace_all(&text, "etc").to_string();
+        text = YEAH_RE.replace_all(&text, "${1}e'a").to_string();
 
-    // Convert numbers to text before other number processing
-    text = convert_numbers_to_text(&text);
+        // Convert numbers to text before other number processing
+        text = convert_numbers_to_text(&text);
 
-    // Note: split_num, flip_money, and point_num functions need to be implemented
-    text = COMMA_NUM_RE.replace_all(&text, "").to_string();
-    text = RANGE_RE.replace_all(&text, " to ").to_string();
-    text = S_AFTER_NUM_RE.replace_all(&text, " S").to_string();
-    text = POSSESSIVE_RE.replace_all(&text, "'S").to_string();
-    text = X_POSSESSIVE_RE.replace_all(&text, "s").to_string();
+        // Note: split_num, flip_money, and point_num functions need to be implemented
+        text = COMMA_NUM_RE.replace_all(&text, "").to_string();
+        text = RANGE_RE.replace_all(&text, " to ").to_string();
+        text = S_AFTER_NUM_RE.replace_all(&text, " S").to_string();
+        text = POSSESSIVE_RE.replace_all(&text, "'S").to_string();
+        text = X_POSSESSIVE_RE.replace_all(&text, "s").to_string();
 
-    // Handle initials and acronyms
-    text = INITIALS_RE
-        .replace_all(&text, |caps: &fancy_regex::Captures| {
-            caps[0].replace('.', "-")
-        })
-        .to_string();
-    text = ACRONYM_RE.replace_all(&text, "-").to_string();
+        // Handle initials and acronyms
+        text = INITIALS_RE
+            .replace_all(&text, |caps: &fancy_regex::Captures| {
+                caps[0].replace('.', "-")
+            })
+            .to_string();
+        text = ACRONYM_RE.replace_all(&text, "-").to_string();
 
-    text.trim().to_string()
+        // Remove all non-alphabetical characters except basic punctuation symbols and whitespace
+        // Keep: letters, numbers (for conversion), whitespace, and basic punctuation only
+        // Basic punctuation: . , ! ? ; :
+        text = text
+            .chars()
+            .filter(|c| {
+                c.is_alphabetic() 
+                || c.is_ascii_digit()  // Keep numbers so they can be converted to words
+                || c.is_whitespace()
+                || matches!(c, '.' | ',' | '!' | '?' | ';' | ':')
+            })
+            .collect();
+
+        text.trim().to_string()
+    }));
+
+    // If normalization panicked, return original text (trimmed)
+    result.unwrap_or_else(|_| text.trim().to_string())
 }
 
 /// Convert numbers and digits to their spelled textual representation
 /// Examples: "123" -> "one hundred twenty three", "5" -> "five", "CHAPTER XIV" -> "CHAPTER fourteen"
+/// This function is panic-safe - any panics in the conversion are caught and the original text is returned
 fn convert_numbers_to_text(text: &str) -> String {
-    let mut result = text.to_string();
+    // Use catch_unwind to prevent panics from propagating - use AssertUnwindSafe for the closure
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut result = text.to_string();
 
-    // Convert Roman numerals first (common in chapter titles like "CHAPTER XIV")
-    result = ROMAN_NUM_RE
-        .replace_all(&result, |caps: &fancy_regex::Captures| {
-            let roman = caps[0].to_uppercase();
-            let num = roman_to_number(&roman);
-            if num > 0 {
-                number_to_words(num)
-            } else {
-                caps[0].to_string()
-            }
-        })
-        .to_string();
+        // Convert Roman numerals first (common in chapter titles like "CHAPTER XIV")
+        result = ROMAN_NUM_RE
+            .replace_all(&result, |caps: &fancy_regex::Captures| {
+                // Catch panics in the replacement callback - use AssertUnwindSafe for the closure
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let roman = caps[0].to_uppercase();
+                    let num = roman_to_number(&roman);
+                    if num > 0 {
+                        number_to_words(num)
+                    } else {
+                        caps[0].to_string()
+                    }
+                }))
+                .unwrap_or_else(|_| caps[0].to_string())
+            })
+            .to_string();
 
-    // Convert Arabic numerals
-    result = INTEGER_RE
-        .replace_all(&result, |caps: &fancy_regex::Captures| {
-            if let Ok(num) = caps[0].parse::<u64>() {
-                number_to_words(num)
-            } else {
-                caps[0].to_string()
-            }
-        })
-        .to_string();
+        // Convert Arabic numerals
+        result = INTEGER_RE
+            .replace_all(&result, |caps: &fancy_regex::Captures| {
+                // Catch panics in the replacement callback - use AssertUnwindSafe for the closure
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Ok(num) = caps[0].parse::<u64>() {
+                        number_to_words(num)
+                    } else {
+                        caps[0].to_string()
+                    }
+                }))
+                .unwrap_or_else(|_| caps[0].to_string())
+            })
+            .to_string();
 
-    result
+        result
+    }));
+
+    // If conversion panicked, return original text
+    result.unwrap_or_else(|_| text.to_string())
 }
 
 /// Convert a number to its English word representation

@@ -43,7 +43,15 @@ fn main() {
     // Test cases including edge cases with UTF-8, numbers, and special characters
     // Store long text in a variable first to avoid temporary value issues
     let long_text = "a".repeat(1000);
-    
+
+    // Store problematic Project Gutenberg text that causes "No tokens generated" error
+    let problematic_gutenberg_text = "Title: Little Women Author: Louisa May Alcott Release date: May 1, 1996 [eBook #514] Most recently updated: November 4, 2022 Language: English *** START OF THE PROJECT GUTENBERG EBOOK LITTLE WOMEN *** Little Women by Louisa May Alcott Contents PART 1 CHAPTER ONE PLAYING PILGRIMS CHAPTER TWO A MERRY CHRISTMAS CHAPTER THREE THE LAURENCE BOY CHAPTER FOUR BURDENS CHAPTER FIVE BEING NEIGHBORLY CHAPTER SIX BETH FINDS THE PALACE BEAUTIFUL CHAPTER SEVEN AMY'S VALLEY OF HUMILIATION.".to_string();
+
+    // Store another problematic 10-word chunk that causes "No tokens generated" error
+    // This is a chunk from the split text that still fails even at 10 words
+    let problematic_chunk_text =
+        "language: english *** start of the project gutenberg ebook little.".to_string();
+
     let mut test_cases: Vec<&str> = vec![
         "hello",
         "world",
@@ -121,20 +129,31 @@ fn main() {
         "hello\u{200C}world", // zero-width non-joiner
         "hello\u{200D}world", // zero-width joiner
         // Combining characters
-        "caf\u{00E9}", // é as combining character
+        "caf\u{00E9}",  // é as combining character
         "na\u{00EF}ve", // ï as combining character
     ];
-    
+
     // Add very long text to test cases
     test_cases.push(&long_text);
 
+    // Add problematic Project Gutenberg text that causes "No tokens generated" error
+    // This text contains special characters, multiple asterisks, and formatting that may cause issues
+    test_cases.push(&problematic_gutenberg_text);
+
+    // Add problematic 10-word chunk that still causes failures
+    // This chunk contains asterisks and special formatting that causes phonemizer issues
+    test_cases.push(&problematic_chunk_text);
+
     println!("\n2. Testing phonemization:");
+    println!(
+        "   Note: Testing problematic Project Gutenberg text that previously caused 'No tokens generated' error"
+    );
     println!("   Total test cases: {}\n", test_cases.len());
-    
+
     let mut passed = 0;
     let mut failed = 0;
     let mut empty_results = 0;
-    
+
     for (i, text) in test_cases.iter().enumerate() {
         // Show text representation (escape special chars for display)
         let display_text = if text.len() > 50 {
@@ -145,19 +164,26 @@ fn main() {
                 .replace('\t', "\\t")
                 .replace('\x00', "\\0")
         };
-        
+
         print!("   Test {}: '{}'", i + 1, display_text);
-        
+
         let phonemes = phonemizer.phonemize(text, true);
-        
+
         if phonemes.is_empty() {
             if text.trim().is_empty() {
                 println!(" → ✓ EMPTY (expected for empty input)");
                 passed += 1;
             } else {
                 println!(" → ✗ EMPTY (unexpected!)");
-                println!("       Input length: {} chars, UTF-8 bytes: {}", text.chars().count(), text.len());
-                println!("       First 10 chars: {:?}", text.chars().take(10).collect::<Vec<_>>());
+                println!(
+                    "       Input length: {} chars, UTF-8 bytes: {}",
+                    text.chars().count(),
+                    text.len()
+                );
+                println!(
+                    "       First 10 chars: {:?}",
+                    text.chars().take(10).collect::<Vec<_>>()
+                );
                 failed += 1;
                 empty_results += 1;
             }
@@ -167,8 +193,11 @@ fn main() {
             passed += 1;
         }
     }
-    
-    println!("\n   Summary: {} passed, {} failed ({} empty results)", passed, failed, empty_results);
+
+    println!(
+        "\n   Summary: {} passed, {} failed ({} empty results)",
+        passed, failed, empty_results
+    );
 
     println!("\n3. Testing with normalization disabled:");
     let test_text = "Hello World";
@@ -180,4 +209,3 @@ fn main() {
 
     println!("\n=== Test Complete ===");
 }
-

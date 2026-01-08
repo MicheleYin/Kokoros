@@ -21,8 +21,14 @@ fn phonemize_text(phonemizer: &Arc<Mutex<Phonemizer>>, text: &str, _lang: &str) 
             phonemizer_guard.phonemize(text, true) // normalize = true
         }
         Err(e) => {
-            tracing::error!("Failed to lock phonemizer (mutex poisoned): {:?}", e);
-            // Return empty string as fallback
+            tracing::error!(
+                "Failed to lock phonemizer (mutex poisoned): {:?}. \
+                This indicates a previous panic occurred. With the catch_unwind fix, \
+                new panics should no longer poison the mutex, but if this error persists, \
+                the phonemizer may need to be reinitialized.",
+                e
+            );
+            // Return empty string as fallback - allows processing to continue
             String::new()
         }
     }
