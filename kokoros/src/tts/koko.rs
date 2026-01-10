@@ -15,23 +15,10 @@ use std::sync::{Arc, Mutex};
 // Phonemizer handles G2P conversion using ONNX models (mini-bart-g2p)
 
 /// Helper function to phonemize text using a shared phonemizer
-fn phonemize_text(phonemizer: &Arc<Mutex<Phonemizer>>, text: &str, _lang: &str) -> String {
-    match phonemizer.lock() {
-        Ok(phonemizer_guard) => {
-            phonemizer_guard.phonemize(text, true) // normalize = true
-        }
-        Err(e) => {
-            tracing::error!(
-                "Failed to lock phonemizer (mutex poisoned): {:?}. \
-                This indicates a previous panic occurred. With the catch_unwind fix, \
-                new panics should no longer poison the mutex, but if this error persists, \
-                the phonemizer may need to be reinitialized.",
-                e
-            );
-            // Return empty string as fallback - allows processing to continue
-            String::new()
-        }
-    }
+/// The phonemizer is thread-safe internally (phoneme_gen uses Mutex internally),
+/// so we can use Arc<Phonemizer> instead of Arc<Mutex<Phonemizer>>
+fn phonemize_text(phonemizer: &Arc<Phonemizer>, text: &str, _lang: &str) -> String {
+    phonemizer.phonemize(text, true) // normalize = true
 }
 
 // Flag to ensure voice styles are only logged once
@@ -86,7 +73,7 @@ pub struct TTSKoko {
     model: Arc<Mutex<ort_koko::OrtKoko>>,
     styles: HashMap<String, Vec<[[f32; 256]; 1]>>,
     init_config: InitConfig,
-    phonemizer: Arc<Mutex<Phonemizer>>,
+    phonemizer: Arc<Phonemizer>,
 }
 
 /// Parallel TTS with multiple ONNX instances for true concurrency
@@ -97,7 +84,7 @@ pub struct TTSKokoParallel {
     models: Vec<Arc<Mutex<ort_koko::OrtKoko>>>,
     styles: HashMap<String, Vec<[[f32; 256]; 1]>>,
     init_config: InitConfig,
-    phonemizer: Arc<Mutex<Phonemizer>>,
+    phonemizer: Arc<Phonemizer>,
 }
 
 #[derive(Clone)]
@@ -135,33 +122,79 @@ impl TTSKoko {
                 .expect("download voices data file failed.");
         }
 
-        let model = Arc::new(Mutex::new(
-            ort_koko::OrtKoko::new(model_path.to_string())
-                .expect("Failed to create Kokoro TTS model"),
-        ));
+        let model = match ort_koko::OrtKoko::new(model_path.to_string()) {
+            Ok(m) => Arc::new(Mutex::new(m)),
+            Err(e) => {
+                let error_msg = format!(
+                    "Failed to create Kokoro TTS model: {}. \
+                    This may indicate:\n\
+                    - Corrupted ONNX model file: {}\n\
+                    - ONNX Runtime initialization failure\n\
+                    - Insufficient memory\n\
+                    - Incompatible ONNX Runtime version",
+                    e, model_path
+                );
+                tracing::error!("{}", error_msg);
+                panic!("{}", error_msg);
+            }
+        };
         // TODO: if(not streaming) { model.print_info(); }
         // model.print_info();
 
         let styles = Self::load_voices(voices_path);
 
-        // Initialize phonemizer (loaded once per TTSKoko instance)
-        // Uses ONNX backend with mini-bart-g2p model
-        // Phonemizer::new() automatically finds the model in common locations
-        // Note: For parallel processing, use TTSKokoParallel which shares a single phonemizer across instances
+        // Initialize phonemizer (simple, like OrtKoko::new)
+        // Derive G2P model path from TTS model path (same directory structure)
+        // In production: if model_path is "/app/resources/kokoro-v1.0.onnx"
+        // then G2P path should be "/app/resources/mini-bart-g2p"
+        let g2p_model_path = {
+            let model_path_buf = Path::new(model_path);
+            if let Some(parent) = model_path_buf.parent() {
+                parent.join("mini-bart-g2p").to_string_lossy().to_string()
+            } else {
+                // Fallback: try auto-detection
+                tracing::warn!("Could not derive G2P path from model path, using auto-detection");
+                String::new()
+            }
+        };
+
         tracing::info!(
             "Initializing phonemizer for single TTSKoko instance (ONNX backend with mini-bart-g2p)..."
         );
-        let phonemizer = match Phonemizer::new("en") {
-            Ok(p) => {
-                tracing::info!("✓ Phonemizer initialized successfully");
-                Arc::new(Mutex::new(p))
+        let phonemizer = if !g2p_model_path.is_empty() && Path::new(&g2p_model_path).exists() {
+            // Use explicit path (like TTS model) - simple and reliable
+            match Phonemizer::new("en", &g2p_model_path) {
+                Ok(p) => {
+                    tracing::info!("✓ Phonemizer initialized successfully from: {}", g2p_model_path);
+                    Arc::new(p)
+                }
+                Err(e) => {
+                    let error_msg = format!(
+                        "Failed to initialize phonemizer from {}: {}. \
+                        Make sure mini-bart-g2p model files are in the specified directory.",
+                        g2p_model_path, e
+                    );
+                    tracing::error!("{}", error_msg);
+                    panic!("{}", error_msg);
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to initialize phonemizer: {}", e);
-                panic!(
-                    "Failed to initialize phonemizer: {}. Make sure mini-bart-g2p model files are in resources.",
-                    e
-                );
+        } else {
+            // Fallback to auto-detection (for backward compatibility)
+            tracing::warn!("G2P model path not found at {}, using auto-detection", g2p_model_path);
+            match Phonemizer::new_auto("en") {
+                Ok(p) => {
+                    tracing::info!("✓ Phonemizer initialized successfully (auto-detected)");
+                    p
+                }
+                Err(e) => {
+                    let error_msg = format!(
+                        "Failed to initialize phonemizer: {}. \
+                        Make sure mini-bart-g2p model files are in resources.",
+                        e
+                    );
+                    tracing::error!("{}", error_msg);
+                    panic!("{}", error_msg);
+                }
             }
         };
 
@@ -200,7 +233,10 @@ impl TTSKoko {
             // A. Tokenize
             // Only build the expensive alignment map if the loaded model supports timestamps.
             let use_alignment = {
-                let model = self.model.lock().unwrap();
+                let model = self
+                    .model
+                    .lock()
+                    .map_err(|e| format!("Mutex poisoned while checking model strategy: {}", e))?;
                 matches!(model.strategy(), Some(ModelStrategy::Timestamped(_)))
             };
 
@@ -247,14 +283,18 @@ impl TTSKoko {
             let tokens_batch = vec![padded_tokens];
 
             // E. Infer
-            let (chunk_audio_array, chunk_durations_opt) = self.model.lock().unwrap().infer(
-                tokens_batch,
-                styles,
-                speed,
-                request_id,
-                instance_id,
-                Some(chunk_num),
-            )?;
+            let (chunk_audio_array, chunk_durations_opt) = self
+                .model
+                .lock()
+                .map_err(|e| format!("Mutex poisoned while inferring audio: {}", e))?
+                .infer(
+                    tokens_batch,
+                    styles,
+                    speed,
+                    request_id,
+                    instance_id,
+                    Some(chunk_num),
+                )?;
 
             let chunk_audio: Vec<f32> = chunk_audio_array.iter().cloned().collect();
 
@@ -1219,19 +1259,46 @@ impl TTSKokoParallel {
         cfg: InitConfig,
         num_instances: usize,
     ) -> Self {
+        // Download model files if they don't exist (with better error messages)
         if !Path::new(model_path).exists() {
-            utils::fileio::download_file_from_url(cfg.model_url.as_str(), model_path)
-                .await
-                .expect("download model failed.");
+            tracing::info!(
+                "Model file not found at {}, downloading from {}",
+                model_path,
+                cfg.model_url
+            );
+            if let Err(e) =
+                utils::fileio::download_file_from_url(cfg.model_url.as_str(), model_path).await
+            {
+                let error_msg = format!(
+                    "Failed to download ONNX model from {} to {}: {}. \
+                    Please check your internet connection and try again, or manually place the model file.",
+                    cfg.model_url, model_path, e
+                );
+                tracing::error!("{}", error_msg);
+                panic!("{}", error_msg);
+            }
         }
 
         if !Path::new(voices_path).exists() {
-            utils::fileio::download_file_from_url(cfg.voices_url.as_str(), voices_path)
-                .await
-                .expect("download voices data file failed.");
+            tracing::info!(
+                "Voices file not found at {}, downloading from {}",
+                voices_path,
+                cfg.voices_url
+            );
+            if let Err(e) =
+                utils::fileio::download_file_from_url(cfg.voices_url.as_str(), voices_path).await
+            {
+                let error_msg = format!(
+                    "Failed to download voices file from {} to {}: {}. \
+                    Please check your internet connection and try again, or manually place the voices file.",
+                    cfg.voices_url, voices_path, e
+                );
+                tracing::error!("{}", error_msg);
+                panic!("{}", error_msg);
+            }
         }
 
-        // Create multiple ONNX model instances
+        // Create multiple ONNX model instances (with better error handling)
         let mut models = Vec::new();
         for i in 0..num_instances {
             tracing::info!(
@@ -1240,36 +1307,81 @@ impl TTSKokoParallel {
                 i + 1,
                 num_instances
             );
-            let model = Arc::new(Mutex::new(
-                ort_koko::OrtKoko::new(model_path.to_string())
-                    .expect("Failed to create Kokoro TTS model"),
-            ));
+            let model = match ort_koko::OrtKoko::new(model_path.to_string()) {
+                Ok(m) => Arc::new(Mutex::new(m)),
+                Err(e) => {
+                    let error_msg = format!(
+                        "Failed to create Kokoro TTS model instance {}: {}. \
+                        This may indicate:\n\
+                        - Corrupted ONNX model file: {}\n\
+                        - ONNX Runtime initialization failure\n\
+                        - Insufficient memory\n\
+                        - Incompatible ONNX Runtime version",
+                        i, e, model_path
+                    );
+                    tracing::error!("{}", error_msg);
+                    panic!("{}", error_msg);
+                }
+            };
             models.push(model);
         }
 
         let styles = TTSKoko::load_voices(voices_path);
 
-        // Initialize shared phonemizer (loaded ONCE per TTSKokoParallel engine, shared across all instances)
-        // Uses ONNX backend with mini-bart-g2p model
-        // Phonemizer::new() automatically finds the model in common locations
-        // This phonemizer will be shared across all num_instances model instances via Arc::clone
+        // Initialize shared phonemizer (simple, like OrtKoko::new)
+        // Derive G2P model path from TTS model path (same directory structure)
+        let g2p_model_path = {
+            let model_path_buf = Path::new(model_path);
+            if let Some(parent) = model_path_buf.parent() {
+                parent.join("mini-bart-g2p").to_string_lossy().to_string()
+            } else {
+                // Fallback: try auto-detection
+                tracing::warn!("Could not derive G2P path from model path, using auto-detection");
+                String::new()
+            }
+        };
+
         tracing::info!(
             "Initializing shared phonemizer (will be reused across {} model instances)...",
             num_instances
         );
-        let phonemizer = match Phonemizer::new("en") {
-            Ok(p) => {
-                tracing::info!(
-                    "✓ Shared phonemizer initialized successfully (ONNX backend with mini-bart-g2p)"
-                );
-                Arc::new(Mutex::new(p))
+        let phonemizer = if !g2p_model_path.is_empty() && Path::new(&g2p_model_path).exists() {
+            // Use explicit path (like TTS model) - simple and reliable
+            match Phonemizer::new("en", &g2p_model_path) {
+                Ok(p) => {
+                    tracing::info!(
+                        "✓ Shared phonemizer initialized successfully from: {}",
+                        g2p_model_path
+                    );
+                    Arc::new(p)
+                }
+                Err(e) => {
+                    let error_msg = format!(
+                        "Failed to initialize phonemizer from {}: {}. \
+                        Make sure mini-bart-g2p model files are in the specified directory.",
+                        g2p_model_path, e
+                    );
+                    tracing::error!("{}", error_msg);
+                    panic!("{}", error_msg);
+                }
             }
-            Err(e) => {
-                tracing::error!("Failed to initialize phonemizer: {}", e);
-                panic!(
-                    "Failed to initialize phonemizer: {}. Make sure mini-bart-g2p model files are in resources.",
-                    e
-                );
+        } else {
+            // Fallback to auto-detection (for backward compatibility)
+            tracing::warn!("G2P model path not found at {}, using auto-detection", g2p_model_path);
+            match Phonemizer::new_auto("en") {
+                Ok(p) => {
+                    tracing::info!("✓ Shared phonemizer initialized successfully (auto-detected)");
+                    p
+                }
+                Err(e) => {
+                    let error_msg = format!(
+                        "Failed to initialize phonemizer: {}. \
+                        Make sure mini-bart-g2p model files are in resources.",
+                        e
+                    );
+                    tracing::error!("{}", error_msg);
+                    panic!("{}", error_msg);
+                }
             }
         };
 

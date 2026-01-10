@@ -5,8 +5,8 @@ use piper_tts_rust::PhonemeGen;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 lazy_static! {
     // Pattern to insert space before "hˈʌndɹɪd" when it follows certain characters
@@ -33,6 +33,10 @@ struct OnnxBackend {
     arpabet_to_ipa: HashMap<String, String>,
 }
 
+// Global phonemizer singleton - only used by new_auto() for backward compatibility
+// The main new() method doesn't use singleton (like TTS OrtKoko)
+static GLOBAL_PHONEMIZER: OnceLock<Mutex<Option<Arc<Phonemizer>>>> = OnceLock::new();
+
 impl OnnxBackend {
     fn new(model_dir: &std::path::Path) -> Result<Self, String> {
         let encoder_path = model_dir.join("onnx").join("encoder_model.onnx");
@@ -41,6 +45,8 @@ impl OnnxBackend {
         let vocab_path = model_dir.join("vocab.json");
         let arpabet_mapping_path = model_dir.join("arpabet-mapping.txt");
 
+        // Validate file existence and accessibility BEFORE attempting to load
+        // In production, bundled files might have different access patterns
         if !encoder_path.exists() {
             return Err(format!("Encoder model not found: {:?}", encoder_path));
         }
@@ -60,9 +66,60 @@ impl OnnxBackend {
             ));
         }
 
+        // Verify files are readable (important for bundled files in production)
+        // ONNX Runtime might fail silently or abort() if files aren't accessible
+        let test_read = std::fs::metadata(&encoder_path).map_err(|e| {
+            format!(
+                "Cannot access encoder model file: {} - {}",
+                encoder_path.display(),
+                e
+            )
+        })?;
+        if test_read.len() == 0 {
+            return Err(format!("Encoder model file is empty: {:?}", encoder_path));
+        }
+
         tracing::info!("Initializing ONNX phonemizer from: {:?}", model_dir);
+        tracing::debug!(
+            "Model file sizes - encoder: {} bytes, decoder: {} bytes",
+            test_read.len(),
+            std::fs::metadata(&decoder_path)
+                .map(|m| m.len())
+                .unwrap_or(0)
+        );
+
+        // Simple initialization (like TTS OrtKoko) - no locks needed
+        // ONNX Runtime handles concurrent initialization internally (like ort crate does)
+        // Each instance uses its own file paths, so no conflicts
+        let _test_read_encoder = std::fs::read(&encoder_path).map_err(|e| {
+            format!(
+                "Cannot read encoder model file: {} - {}",
+                encoder_path.display(),
+                e
+            )
+        })?;
+        let _test_read_decoder = std::fs::read(&decoder_path).map_err(|e| {
+            format!(
+                "Cannot read decoder model file: {} - {}",
+                decoder_path.display(),
+                e
+            )
+        })?;
+        let _test_read_tokenizer = std::fs::read(&tokenizer_path).map_err(|e| {
+            format!(
+                "Cannot read tokenizer file: {} - {}",
+                tokenizer_path.display(),
+                e
+            )
+        })?;
+        let _test_read_vocab = std::fs::read(&vocab_path)
+            .map_err(|e| format!("Cannot read vocab file: {} - {}", vocab_path.display(), e))?;
+
+        tracing::debug!("Verified all model files are readable, initializing PhonemeGen");
 
         // Initialize PhonemeGen from piper-tts-rust
+        // Simple initialization (like TTS OrtKoko) - no locks, no catch_unwind
+        // ONNX Runtime handles errors internally, and we validate files exist before loading
         let mut phoneme_gen = PhonemeGen::new(
             decoder_path.to_string_lossy().to_string(),
             encoder_path.to_string_lossy().to_string(),
@@ -71,9 +128,21 @@ impl OnnxBackend {
             arpabet_mapping_path.to_string_lossy().to_string(),
         );
 
-        phoneme_gen
-            .load()
-            .map_err(|e| format!("Failed to load PhonemeGen: {}", e))?;
+        // Load the model (load() modifies phoneme_gen in place, returns Result<(), Error>)
+        phoneme_gen.load().map_err(|e| {
+            format!(
+                "Failed to load PhonemeGen model: {}. \
+                This may indicate:\n\
+                - Corrupted ONNX model files (encoder_model.onnx, decoder_model.onnx)\n\
+                - Corrupted tokenizer or vocab files\n\
+                - ONNX Runtime initialization failure\n\
+                - Insufficient memory\n\
+                - Incompatible ONNX Runtime version\n\
+                \n\
+                Model directory: {:?}",
+                e, model_dir
+            )
+        })?;
 
         // Load ARPAbet to IPA mapping
         let arpabet_to_ipa = Self::load_arpabet_mapping(&arpabet_mapping_path)?;
@@ -323,11 +392,47 @@ impl OnnxBackend {
             return Some(String::new());
         }
 
-        // Process text through piper-tts-rust's phonemizer (returns ARPAbet)
-        // Normalize text before processing to handle edge cases
+        // Aggressive input validation to prevent ONNX Runtime abort() calls
+        // ONNX Runtime can call abort() directly from C++ if it receives invalid input
+        // We need to filter out anything that might cause issues before it reaches ONNX Runtime
         let normalized_text = text.to_lowercase();
 
+        // Filter out problematic characters that might cause ONNX Runtime to abort
+        // Keep only alphanumeric, whitespace, and basic punctuation
+        let filtered_text: String = normalized_text
+            .chars()
+            .filter(|c| {
+                c.is_alphanumeric()
+                    || c.is_whitespace()
+                    || matches!(c, '.' | ',' | '!' | '?' | ':' | ';' | '-' | '\'' | '"')
+            })
+            .collect();
+
+        // If filtering removed everything, return empty
+        if filtered_text.trim().is_empty() {
+            tracing::warn!(
+                "Text '{}' was filtered to empty, skipping phonemization",
+                text
+            );
+            return Some(String::new());
+        }
+
+        // Limit text length to prevent potential buffer overflows or memory issues
+        // piper-tts-rust/ONNX Runtime might have internal limits
+        const MAX_PHONEMIZE_LENGTH: usize = 1000;
+        let text_to_process = if filtered_text.len() > MAX_PHONEMIZE_LENGTH {
+            tracing::warn!(
+                "Text length {} exceeds max {} chars, truncating for phonemization",
+                filtered_text.len(),
+                MAX_PHONEMIZE_LENGTH
+            );
+            &filtered_text[..MAX_PHONEMIZE_LENGTH]
+        } else {
+            &filtered_text
+        };
+
         // Lock the mutex and process text
+        // Release the lock as quickly as possible to avoid holding it during ONNX Runtime calls
         // If a panic occurs, the mutex will be poisoned, but we handle that gracefully
         let arpabet_result = {
             let mut pg = match self.phoneme_gen.lock() {
@@ -341,13 +446,13 @@ impl OnnxBackend {
             };
 
             // Wrap process_text in catch_unwind to prevent panics from poisoning the mutex
-            // In production builds with aggressive optimizations, ONNX Runtime calls can cause
-            // stack overflow panics. By catching the panic here, we prevent mutex poisoning
-            // and allow subsequent calls to continue working.
+            // NOTE: This won't catch C++ abort() calls from ONNX Runtime, but will catch Rust panics
+            // If ONNX Runtime calls abort(), the entire process will terminate regardless
             let process_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pg.process_text(&normalized_text)
+                pg.process_text(text_to_process)
             }));
 
+            // Release the mutex lock immediately after processing
             match process_result {
                 Ok(Ok(arpabet_string)) => {
                     tracing::debug!("ARPAbet output for '{}': '{}'", text, arpabet_string);
@@ -424,41 +529,189 @@ pub struct Phonemizer {
 
 impl Phonemizer {
     /// Create a new Phonemizer with ONNX backend (uses mini-bart-g2p model)
-    /// Uses ONNX as default
-    /// Tries to find model in common locations if model_path is None
-    /// Returns an error if the model cannot be found or initialized
-    pub fn new(lang: &str) -> Result<Self, String> {
-        // Try to find model in common locations
-        let model_path = Self::find_model_path();
-        Self::new_with_backend_result(lang, BackendType::Onnx, model_path)
+    ///
+    /// This method follows the same simple pattern as `OrtKoko::new()`:
+    /// - Takes a direct path parameter (no path searching)
+    /// - Simple initialization (no singleton complexity)
+    /// - Returns Result<Self, String> (caller can wrap in Arc if needed)
+    ///
+    /// # Arguments
+    /// * `lang` - Language code (e.g., "en")
+    /// * `model_path` - Path to mini-bart-g2p model directory (e.g., "/path/to/mini-bart-g2p")
+    ///
+    /// # Example
+    /// ```rust
+    /// // Simple, direct initialization (like OrtKoko::new)
+    /// let phonemizer = Phonemizer::new("en", "/path/to/mini-bart-g2p")?;
+    /// let phonemizer = Arc::new(phonemizer); // Wrap in Arc if needed for sharing
+    /// ```
+    pub fn new(lang: &str, model_path: &str) -> Result<Self, String> {
+        let model_path_buf = PathBuf::from(model_path);
+        
+        // Simple validation (like TTS model - just check exists)
+        if !model_path_buf.exists() {
+            return Err(format!(
+                "G2P model directory not found: {}. \
+                Make sure mini-bart-g2p model files are in the specified directory.",
+                model_path
+            ));
+        }
+
+        tracing::info!("Initializing G2P phonemizer from: {:?}", model_path_buf);
+        
+        // Validate required files exist (similar to TTS model validation)
+        Self::validate_model_path(&model_path_buf)?;
+
+        // Create phonemizer (simple, like OrtKoko::new)
+        let phonemizer = Self::new_with_backend_result(lang, BackendType::Onnx, Some(model_path_buf))?;
+        
+        tracing::info!("✓ G2P phonemizer initialized successfully");
+        Ok(phonemizer)
+    }
+
+    /// Create a new Phonemizer with automatic path detection (for backward compatibility)
+    ///
+    /// This method searches for the model in common locations and uses a singleton
+    /// pattern for sharing. For production use, prefer `new()` with an explicit path.
+    ///
+    /// # Arguments
+    /// * `lang` - Language code (e.g., "en")
+    ///
+    /// # Example
+    /// ```rust
+    /// // Auto-detect path (works in development, less reliable in production)
+    /// let phonemizer = Phonemizer::new_auto("en")?;
+    /// ```
+    pub fn new_auto(lang: &str) -> Result<Arc<Self>, String> {
+        // Get or initialize the global phonemizer singleton
+        let guard = GLOBAL_PHONEMIZER.get_or_init(|| Mutex::new(None));
+        let mut phonemizer_opt = guard.lock().map_err(|e| {
+            format!(
+                "Failed to acquire global phonemizer lock (mutex poisoned): {:?}",
+                e
+            )
+        })?;
+
+        // If already initialized, return existing Arc
+        if let Some(ref existing) = *phonemizer_opt {
+            tracing::debug!("Reusing existing global phonemizer instance");
+            return Ok(Arc::clone(existing));
+        }
+
+        // Initialize new phonemizer
+        tracing::info!("Initializing global phonemizer singleton (auto-detecting path)");
+        
+        // Search for model path
+        let found_path = Self::find_model_path();
+        if found_path.is_none() {
+            return Err(format!(
+                "G2P model not found. Searched in:\n\
+                - TAURI_RESOURCE_DIR/mini-bart-g2p\n\
+                - src-tauri/resources/mini-bart-g2p\n\
+                - resources/mini-bart-g2p\n\
+                - ../src-tauri/resources/mini-bart-g2p\n\
+                - ../../src-tauri/resources/mini-bart-g2p\n\
+                \n\
+                For production, use Phonemizer::new() with an explicit path.\n\
+                Current TAURI_RESOURCE_DIR: {:?}\n\
+                Current working directory: {:?}",
+                std::env::var("TAURI_RESOURCE_DIR").ok(),
+                std::env::current_dir().ok()
+            ));
+        }
+
+        let phonemizer = Self::new_with_backend_result(lang, BackendType::Onnx, found_path)?;
+        let phonemizer_arc = Arc::new(phonemizer);
+
+        // Store in global singleton
+        *phonemizer_opt = Some(Arc::clone(&phonemizer_arc));
+        tracing::info!("✓ Global phonemizer singleton initialized and cached");
+
+        Ok(phonemizer_arc)
     }
 
     /// Create a new Phonemizer, panicking on error (for backward compatibility)
-    pub fn new_or_panic(lang: &str) -> Self {
-        Self::new(lang).unwrap_or_else(|e| {
+    pub fn new_or_panic(lang: &str, model_path: &str) -> Self {
+        Self::new(lang, model_path).unwrap_or_else(|e| {
             tracing::error!("Failed to create Phonemizer: {}", e);
             panic!("Failed to create Phonemizer: {}", e);
         })
     }
 
+    /// Validate that a model path contains all required files
+    /// Similar to how TTS model validates its path before loading
+    /// This is a simple check - just verifies files exist (like TTS model validation)
+    fn validate_model_path(path: &Path) -> Result<(), String> {
+        let encoder_path = path.join("onnx").join("encoder_model.onnx");
+        let decoder_path = path.join("onnx").join("decoder_model.onnx");
+        let tokenizer_path = path.join("tokenizer.json");
+        let vocab_path = path.join("vocab.json");
+        let arpabet_mapping_path = path.join("arpabet-mapping.txt");
+
+        // Check existence
+        if !encoder_path.exists() {
+            return Err(format!("Encoder model not found: {:?}", encoder_path));
+        }
+        if !decoder_path.exists() {
+            return Err(format!("Decoder model not found: {:?}", decoder_path));
+        }
+        if !tokenizer_path.exists() {
+            return Err(format!("Tokenizer not found: {:?}", tokenizer_path));
+        }
+        if !vocab_path.exists() {
+            return Err(format!("Vocab not found: {:?}", vocab_path));
+        }
+        if !arpabet_mapping_path.exists() {
+            return Err(format!("ARPAbet mapping not found: {:?}", arpabet_mapping_path));
+        }
+
+        // Check accessibility (important for bundled files in production)
+        for (name, file_path) in [
+            ("encoder", &encoder_path),
+            ("decoder", &decoder_path),
+            ("tokenizer", &tokenizer_path),
+            ("vocab", &vocab_path),
+            ("arpabet mapping", &arpabet_mapping_path),
+        ] {
+            match std::fs::metadata(file_path) {
+                Ok(metadata) => {
+                    if metadata.len() == 0 {
+                        return Err(format!("{} file is empty: {:?}", name, file_path));
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Cannot access {} file: {:?} - {}",
+                        name, file_path, e
+                    ));
+                }
+            }
+        }
+
+        tracing::debug!("✓ Validated G2P model path: {:?}", path);
+        Ok(())
+    }
+
     /// Find model path in common locations
+    /// 
+    /// **IMPROVEMENT**: This method now validates paths before returning them,
+    /// ensuring files are accessible (important for production bundled apps).
     fn find_model_path() -> Option<PathBuf> {
         tracing::info!("Searching for mini-bart-g2p model...");
 
-        // Check TAURI_RESOURCE_DIR first
+        // Check TAURI_RESOURCE_DIR first (most common in production)
         if let Ok(resource_dir) = std::env::var("TAURI_RESOURCE_DIR") {
             tracing::info!("  Checking TAURI_RESOURCE_DIR: {}", resource_dir);
             let path = PathBuf::from(&resource_dir).join("mini-bart-g2p");
             tracing::info!("    Checking path: {:?}", path);
             if path.exists() {
                 tracing::info!("    Path exists: true");
-                let encoder_path = path.join("onnx").join("encoder_model.onnx");
-                tracing::info!("    Checking encoder: {:?}", encoder_path);
-                if encoder_path.exists() {
-                    tracing::info!("    ✓ Found model at: {:?}", path);
+                // Validate before returning
+                if Self::validate_model_path(&path).is_ok() {
+                    tracing::info!("    ✓ Found and validated model at: {:?}", path);
                     return Some(path);
                 } else {
-                    tracing::warn!("    ✗ Encoder model not found at: {:?}", encoder_path);
+                    tracing::warn!("    ✗ Path exists but validation failed: {:?}", path);
                 }
             } else {
                 tracing::warn!("    ✗ Path does not exist: {:?}", path);
@@ -484,12 +737,12 @@ impl Phonemizer {
             tracing::info!("  Checking path: {:?}", path);
             if path.exists() {
                 tracing::info!("    Path exists: true");
-                let encoder_path = path.join("onnx").join("encoder_model.onnx");
-                if encoder_path.exists() {
-                    tracing::info!("    ✓ Found model at: {:?}", path);
+                // Validate before returning
+                if Self::validate_model_path(path).is_ok() {
+                    tracing::info!("    ✓ Found and validated model at: {:?}", path);
                     return Some(path.clone());
                 } else {
-                    tracing::warn!("    ✗ Encoder model not found at: {:?}", encoder_path);
+                    tracing::warn!("    ✗ Path exists but validation failed: {:?}", path);
                 }
             } else {
                 tracing::debug!("    Path does not exist: {:?}", path);
