@@ -61,15 +61,18 @@ pub fn normalize_text(text: &str) -> String {
         text = ETC_RE.replace_all(&text, "etc").to_string();
         text = YEAH_RE.replace_all(&text, "${1}e'a").to_string();
 
+        // Misaki-rs handles number conversion and special characters now.
+        // We disabled the manual number conversion and aggressive filtering here.
+        
         // Convert numbers to text before other number processing
-        text = convert_numbers_to_text(&text);
+        // text = convert_numbers_to_text(&text);
 
         // Note: split_num, flip_money, and point_num functions need to be implemented
-        text = COMMA_NUM_RE.replace_all(&text, "").to_string();
-        text = RANGE_RE.replace_all(&text, " to ").to_string();
-        text = S_AFTER_NUM_RE.replace_all(&text, " S").to_string();
-        text = POSSESSIVE_RE.replace_all(&text, "'S").to_string();
-        text = X_POSSESSIVE_RE.replace_all(&text, "s").to_string();
+        // text = COMMA_NUM_RE.replace_all(&text, "").to_string();
+        // text = RANGE_RE.replace_all(&text, " to ").to_string();
+        // text = S_AFTER_NUM_RE.replace_all(&text, " S").to_string();
+        // text = POSSESSIVE_RE.replace_all(&text, "'S").to_string();
+        // text = X_POSSESSIVE_RE.replace_all(&text, "s").to_string();
 
         // Handle initials and acronyms
         text = INITIALS_RE
@@ -82,15 +85,16 @@ pub fn normalize_text(text: &str) -> String {
         // Remove all non-alphabetical characters except basic punctuation symbols and whitespace
         // Keep: letters, numbers (for conversion), whitespace, and basic punctuation only
         // Basic punctuation: . , ! ? ; :
-        text = text
-            .chars()
-            .filter(|c| {
-                c.is_alphabetic() 
-                || c.is_ascii_digit()  // Keep numbers so they can be converted to words
-                || c.is_whitespace()
-                || matches!(c, '.' | ',' | '!' | '?' | ';' | ':')
-            })
-            .collect();
+        // text = text
+        //     .chars()
+        //     .filter(|c| {
+        //         c.is_alphabetic() 
+        //         || c.is_ascii_digit()  // Keep numbers so they can be converted to words
+        //         || c.is_whitespace()
+        //         || matches!(c, '.' | ',' | '!' | '?' | ';' | ':')
+        //         || *c == '\'' // Keep apostrophes for contractions
+        //     })
+        //     .collect();
 
         text.trim().to_string()
     }));
@@ -102,6 +106,7 @@ pub fn normalize_text(text: &str) -> String {
 /// Convert numbers and digits to their spelled textual representation
 /// Examples: "123" -> "one hundred twenty three", "5" -> "five", "CHAPTER XIV" -> "CHAPTER fourteen"
 /// This function is panic-safe - any panics in the conversion are caught and the original text is returned
+#[allow(dead_code)]
 fn convert_numbers_to_text(text: &str) -> String {
     // Use catch_unwind to prevent panics from propagating - use AssertUnwindSafe for the closure
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

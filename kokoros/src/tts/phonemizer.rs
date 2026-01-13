@@ -36,9 +36,13 @@ static GLOBAL_PHONEMIZER: OnceLock<Mutex<Option<Arc<Phonemizer>>>> = OnceLock::n
 
 impl MisakiBackend {
     fn new(lang: &str) -> Result<Self, String> {
-        let british = lang == "b" || lang == "en-gb";
+        let language = if lang == "b" || lang == "en-gb" {
+            misaki_rs::Language::EnglishGB
+        } else {
+            misaki_rs::Language::EnglishUS
+        };
         Ok(Self {
-            g2p: G2P::new(british),
+            g2p: G2P::new(language),
         })
     }
 
@@ -243,5 +247,32 @@ impl Phonemizer {
         ps = ps.chars().filter(|&c| VOCAB.contains_key(&c)).collect();
 
         ps.trim().to_string()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_misaki_abbreviations() {
+        let phonemizer = Phonemizer::new("a", "ignored_path").unwrap();
+        let cases = vec![
+            "I'll", "I've", "it's", "he's", "she's", "we're", "they're",
+            "isn't", "aren't", "wasn't", "weren't",
+            "don't", "doesn't", "didn't",
+            "can't", "couldn't", "shouldn't", "wouldn't", "won't",
+            "hasn't", "haven't", "hadn't",
+            "let's", "that's", "what's", "who's", "here's", "there's", "where's",
+            "how's",
+        ];
+        
+        for text in cases {
+            let p = phonemizer.phonemize(text, true); // true = normalize
+            println!("'{}' -> '{}'", text, p);
+            assert!(!p.is_empty(), "Phonemes empty for '{}'", text);
+            // Verify that we didn't lose the contraction phonemes due to normalization stripping '
+            // e.g. "don't" should not sound like "dont" (unknown)
+            // misaki returns IPA.
+        }
     }
 }
