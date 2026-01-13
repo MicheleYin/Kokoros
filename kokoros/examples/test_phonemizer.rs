@@ -21,7 +21,7 @@ fn main() {
 
     // Try to create phonemizer
     println!("1. Creating Phonemizer...");
-    let phonemizer = match Phonemizer::new("en") {
+    let phonemizer = match Phonemizer::new("en", "") {
         Ok(p) => {
             println!("   ✓ Phonemizer created successfully");
             println!("   Backend type: {:?}", p.backend_type());

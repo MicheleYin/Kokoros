@@ -21,6 +21,76 @@ fn phonemize_text(phonemizer: &Arc<Phonemizer>, text: &str, _lang: &str) -> Stri
     phonemizer.phonemize(text, true) // normalize = true
 }
 
+/// Phonemize text in chunks of up to 10 words and reconstruct the sentence IPA string
+/// This ensures better prosody and avoids pauses from incorrect sentence splitting
+///
+/// Process:
+/// 1. Split text into words (handling punctuation attached to words)
+/// 2. Group words into chunks of up to 10 words per chunk
+/// 3. Phonemize each chunk together (preserves context and prosody within the chunk)
+/// 4. Reconstruct the full sentence IPA string by joining chunk phonemes
+///
+/// This approach preserves word boundaries and ensures words are phonemized
+/// in context (up to 10 words at a time), then reconstructed into a continuous IPA string
+/// for proper TTS prosody without artificial pauses.
+fn phonemize_text_word_by_word(phonemizer: &Arc<Phonemizer>, text: &str, _lang: &str) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+
+    // Split text into words (whitespace-separated tokens)
+    // Each token may contain a word with attached punctuation (e.g., "word," "hello!")
+    let words: Vec<&str> = text.split_whitespace().filter(|s| !s.is_empty()).collect();
+
+    if words.is_empty() {
+        return String::new();
+    }
+
+    const MAX_WORDS_PER_CHUNK: usize = 10;
+    let mut reconstructed_phonemes = Vec::new();
+
+    // Process words in chunks of up to 10 words
+    for chunk in words.chunks(MAX_WORDS_PER_CHUNK) {
+        // Join words in the chunk back into a text string for phonemization
+        // This preserves context and prosody within the chunk
+        let chunk_text = chunk.join(" ");
+
+        if chunk_text.trim().is_empty() {
+            continue;
+        }
+
+        // Phonemize the entire chunk together (preserves prosody and context)
+        let chunk_phonemes = phonemizer.phonemize(&chunk_text, true); // normalize = true
+
+        if !chunk_phonemes.is_empty() {
+            reconstructed_phonemes.push(chunk_phonemes);
+        } else {
+            tracing::warn!(
+                "Empty phonemes for chunk: '{}' ({} words), skipping",
+                chunk_text,
+                chunk.len()
+            );
+        }
+    }
+
+    // Reconstruct the sentence by joining chunk phonemes WITHOUT spaces
+    // This creates a continuous IPA string that flows naturally without artificial pauses
+    // Word boundaries are preserved through phoneme context and stress markers within each chunk's phonemes
+    // Joining without spaces ensures smooth prosody and avoids weird pauses from incorrect sentence splitting
+    let reconstructed = reconstructed_phonemes.join("");
+
+    tracing::debug!(
+        "Chunked phonemization (max 10 words/chunk): '{}' -> '{}' ({} words in {} chunks, {} chars)",
+        text,
+        reconstructed,
+        words.len(),
+        (words.len() + MAX_WORDS_PER_CHUNK - 1) / MAX_WORDS_PER_CHUNK, // ceiling division
+        reconstructed.len()
+    );
+
+    reconstructed
+}
+
 // Flag to ensure voice styles are only logged once
 static VOICES_LOGGED: AtomicBool = AtomicBool::new(false);
 
@@ -165,7 +235,10 @@ impl TTSKoko {
             // Use explicit path (like TTS model) - simple and reliable
             match Phonemizer::new("en", &g2p_model_path) {
                 Ok(p) => {
-                    tracing::info!("✓ Phonemizer initialized successfully from: {}", g2p_model_path);
+                    tracing::info!(
+                        "✓ Phonemizer initialized successfully from: {}",
+                        g2p_model_path
+                    );
                     Arc::new(p)
                 }
                 Err(e) => {
@@ -180,7 +253,10 @@ impl TTSKoko {
             }
         } else {
             // Fallback to auto-detection (for backward compatibility)
-            tracing::warn!("G2P model path not found at {}, using auto-detection", g2p_model_path);
+            tracing::warn!(
+                "G2P model path not found at {}, using auto-detection",
+                g2p_model_path
+            );
             match Phonemizer::new_auto("en") {
                 Ok(p) => {
                     tracing::info!("✓ Phonemizer initialized successfully (auto-detected)");
@@ -532,8 +608,9 @@ impl TTSKoko {
         // per-word phoneme tokenization. This keeps audio natural while providing
         // robust timestamps even when the phonemizer merges words (e.g., "the model").
 
-        // 1) Full-phrase phonemes and tokens (prosody source)
-        let full_phonemes = phonemize_text(&self.phonemizer, text, lan);
+        // 1) Phonemize word-by-word and reconstruct sentence IPA string (prosody source)
+        // This ensures better prosody and avoids pauses from incorrect sentence splitting
+        let full_phonemes = phonemize_text_word_by_word(&self.phonemizer, text, lan);
         let all_tokens = tokenize(&full_phonemes);
 
         // 2) Build a tokenization plan per original "word or punctuation" unit.
@@ -706,13 +783,15 @@ impl TTSKoko {
     }
 
     /// Fast tokenization path for audio-only models (no timestamps)
-    /// Performs a single phonemization for the full text and returns tokens with an empty word map.
+    /// Performs word-by-word phonemization and reconstructs the sentence IPA string.
+    /// This ensures better prosody and avoids pauses from incorrect sentence splitting.
     fn tokenize_full_no_alignment(
         &self,
         text: &str,
         lan: &str,
     ) -> (Vec<i64>, Vec<(String, usize, usize)>) {
-        let full_phonemes = phonemize_text(&self.phonemizer, text, lan);
+        // Phonemize word-by-word and reconstruct the sentence IPA string
+        let full_phonemes = phonemize_text_word_by_word(&self.phonemizer, text, lan);
         if full_phonemes.is_empty() {
             tracing::error!(
                 "Phonemizer returned empty phonemes for text: '{}'. This usually means the model failed to load.",
@@ -1367,7 +1446,10 @@ impl TTSKokoParallel {
             }
         } else {
             // Fallback to auto-detection (for backward compatibility)
-            tracing::warn!("G2P model path not found at {}, using auto-detection", g2p_model_path);
+            tracing::warn!(
+                "G2P model path not found at {}, using auto-detection",
+                g2p_model_path
+            );
             match Phonemizer::new_auto("en") {
                 Ok(p) => {
                     tracing::info!("✓ Shared phonemizer initialized successfully (auto-detected)");

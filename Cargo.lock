@@ -1155,6 +1155,7 @@ dependencies = [
  "hound",
  "indicatif",
  "lazy_static",
+ "misaki-rs",
  "mp3lame-encoder",
  "ndarray",
  "ndarray-npy",
@@ -1320,6 +1321,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "misaki-rs"
+version = "0.1.0"
+dependencies = [
+ "fancy-regex",
+ "num2words",
+ "regex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1464,6 +1476,12 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
 ]
+
+[[package]]
+name = "num2words"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1f9771c0512b6a954a62b5106cc000bb5d77b1f60a792b5f70f531b84baefff"
 
 [[package]]
 name = "number_prefix"
