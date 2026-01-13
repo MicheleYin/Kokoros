@@ -59,6 +59,8 @@ fn main() {
         "testing phonemization",
         "Hello, world!",
         "123",
+        "restriction",
+        "restrictions",
         "",
         // Number edge cases
         "CHAPTER XIV",
