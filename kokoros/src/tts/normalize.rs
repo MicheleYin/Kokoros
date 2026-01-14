@@ -11,18 +11,7 @@ lazy_static! {
     static ref MRS_RE: Regex = Regex::new(r"\b(?:Mrs\.|MRS\.(?= [A-Z]))").unwrap();
     static ref ETC_RE: Regex = Regex::new(r"\betc\.(?! [A-Z])").unwrap();
     static ref YEAH_RE: Regex = Regex::new(r"(?i)\b(y)eah?\b").unwrap();
-    static ref NUMBERS_RE: Regex =
-        Regex::new(r"\d*\.\d+|\b\d{4}s?\b|(?<!:)\b(?:[1-9]|1[0-2]):[0-5]\d\b(?!:)").unwrap();
-    static ref COMMA_NUM_RE: Regex = Regex::new(r"(?<=\d),(?=\d)").unwrap();
-    static ref MONEY_RE: Regex = Regex::new(
-        r"(?i)[$£]\d+(?:\.\d+)?(?: hundred| thousand| (?:[bm]|tr)illion)*\b|[$£]\d+\.\d\d?\b"
-    )
-    .unwrap();
-    static ref POINT_NUM_RE: Regex = Regex::new(r"\d*\.\d+").unwrap();
-    static ref RANGE_RE: Regex = Regex::new(r"(?<=\d)-(?=\d)").unwrap();
-    static ref S_AFTER_NUM_RE: Regex = Regex::new(r"(?<=\d)S").unwrap();
-    static ref POSSESSIVE_RE: Regex = Regex::new(r"(?<=[BCDFGHJ-NP-TV-Z])'?s\b").unwrap();
-    static ref X_POSSESSIVE_RE: Regex = Regex::new(r"(?<=X')S\b").unwrap();
+   
     static ref INITIALS_RE: Regex = Regex::new(r"(?:[A-Za-z]\.){2,} [a-z]").unwrap();
     static ref ACRONYM_RE: Regex = Regex::new(r"(?i)(?<=[A-Z])\.(?=[A-Z])").unwrap();
     // Match standalone integers (not part of words or already converted)
@@ -40,7 +29,10 @@ pub fn normalize_text(text: &str) -> String {
         text = text.replace('\u{2018}', "'").replace('\u{2019}', "'");
         text = text.replace('«', "\u{201C}").replace('»', "\u{201D}");
         text = text.replace('\u{201C}', "\"").replace('\u{201D}', "\"");
-        text = text.replace('(', "«").replace(')', "»");
+        text = text.replace('(', " ").replace(')', " ");
+        // replace square and curly brackets
+        text = text.replace('[', " ").replace(']', " ");
+        text = text.replace('{', " ").replace('}', " ");
 
         // Replace Chinese/Japanese punctuation
         let from_chars = ['、', '。', '！', '，', '：', '；', '？'];
@@ -49,6 +41,17 @@ pub fn normalize_text(text: &str) -> String {
         for (from, to) in from_chars.iter().zip(to_chars.iter()) {
             text = text.replace(*from, &format!("{} ", to));
         }
+
+        // replace all other punctuation with space
+        text = text.replace('-', " ").replace('_', " ");
+        text = text.replace('*', " ").replace('&', " ");
+        text = text.replace('^', " ").replace('%', " ");
+        text = text.replace('@', " ").replace('#', " ");
+        text = text.replace('|', " ").replace('~', " ");
+        text = text.replace('`', " ").replace('~', " ");
+        text = text.replace('~', " ").replace('~', " ");
+        text = text.replace('—', " ").replace('–', " ");
+
 
         // Apply regex replacements
         text = WHITESPACE_RE.replace_all(&text, " ").to_string();
@@ -62,17 +65,7 @@ pub fn normalize_text(text: &str) -> String {
         text = YEAH_RE.replace_all(&text, "${1}e'a").to_string();
 
         // Misaki-rs handles number conversion and special characters now.
-        // We disabled the manual number conversion and aggressive filtering here.
         
-        // Convert numbers to text before other number processing
-        // text = convert_numbers_to_text(&text);
-
-        // Note: split_num, flip_money, and point_num functions need to be implemented
-        // text = COMMA_NUM_RE.replace_all(&text, "").to_string();
-        // text = RANGE_RE.replace_all(&text, " to ").to_string();
-        // text = S_AFTER_NUM_RE.replace_all(&text, " S").to_string();
-        // text = POSSESSIVE_RE.replace_all(&text, "'S").to_string();
-        // text = X_POSSESSIVE_RE.replace_all(&text, "s").to_string();
 
         // Handle initials and acronyms
         text = INITIALS_RE
@@ -85,16 +78,17 @@ pub fn normalize_text(text: &str) -> String {
         // Remove all non-alphabetical characters except basic punctuation symbols and whitespace
         // Keep: letters, numbers (for conversion), whitespace, and basic punctuation only
         // Basic punctuation: . , ! ? ; :
-        // text = text
-        //     .chars()
-        //     .filter(|c| {
-        //         c.is_alphabetic() 
-        //         || c.is_ascii_digit()  // Keep numbers so they can be converted to words
-        //         || c.is_whitespace()
-        //         || matches!(c, '.' | ',' | '!' | '?' | ';' | ':')
-        //         || *c == '\'' // Keep apostrophes for contractions
-        //     })
-        //     .collect();
+        text = text
+            .chars()
+            .filter(|c| {
+                c.is_alphabetic() 
+                || c.is_ascii_digit()  // Keep numbers so they can be converted to words
+                || c.is_whitespace()
+                || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '\'')
+            })
+            .collect();
+        // lowercase the text
+        // text = text.to_lowercase();
 
         text.trim().to_string()
     }));
