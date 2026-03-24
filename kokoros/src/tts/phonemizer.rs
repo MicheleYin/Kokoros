@@ -47,7 +47,7 @@ impl MisakiBackend {
     }
 
     fn phonemize(&self, text: &str, _language: &str) -> Option<String> {
-        let (phonemes, _) = self.g2p.g2p(text);
+        let (phonemes, _) = self.g2p.g2p(text).ok()?;
         Some(phonemes)
     }
 }

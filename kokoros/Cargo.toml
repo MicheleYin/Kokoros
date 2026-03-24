@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-piper-tts-rust = "0.1.1"
 hound = "3.5.1"
 indicatif = "0.17.11"
 ndarray = "0.16.1"
@@ -21,7 +20,6 @@ tracing = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 opus = "0.3"
 ogg = "0.9"
-tokenizers = "0.19"
 
 # Base ONNX Runtime configuration
 # Use official ort from crates.io
