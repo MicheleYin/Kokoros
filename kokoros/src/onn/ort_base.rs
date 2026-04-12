@@ -1,16 +1,25 @@
 use ort::session::builder::SessionBuilder;
 use ort::session::Session;
-use ort::logging::LogLevel;
+use ort::ep;
 
 pub trait OrtBase {
     fn load_model(&mut self, model_path: String) -> Result<(), String> {
         match SessionBuilder::new() {
             Ok(builder) => {
-                // CPU execution provider is the default, so we don't need to specify it explicitly
-                // If CUDA is needed, it can be added via features and the ep module when available
+                // Register execution providers: CoreML for Apple devices acceleration
+                let mut builder = builder
+                    .with_execution_providers([
+                         
+                        
+                        
+                        ep::CPU::default()
+                            // .with_fast_math(true)
+                            .build()
+                        // CoreML for Apple devices acceleration with fast math enabled
+                    ])
+                    .map_err(|e| format!("Failed to register execution providers: {}", e))?;
+                
                 let session = builder
-                    .with_log_level(LogLevel::Warning)
-                    .map_err(|e| format!("Failed to set log level: {}", e))?
                     .commit_from_file(model_path)
                     .map_err(|e| format!("Failed to commit from file: {}", e))?;
                 self.set_sess(session);
@@ -23,19 +32,15 @@ pub trait OrtBase {
     fn print_info(&self) {
         if let Some(session) = self.sess() {
             eprintln!("Input names:");
-            for input in &session.inputs {
-                eprintln!("  - {}", input.name);
+            for input in session.inputs() {
+                eprintln!("  - {}", input.name());
             }
             eprintln!("Output names:");
-            for output in &session.outputs {
-                eprintln!("  - {}", output.name);
+            for output in session.outputs() {
+                eprintln!("  - {}", output.name());
             }
 
-            #[cfg(feature = "cuda")]
-            eprintln!("Configured with: CUDA execution provider");
-
-            #[cfg(not(feature = "cuda"))]
-            eprintln!("Configured with: CPU execution provider");
+            eprintln!("Configured with: CoreML execution provider with fast math enabled");
         } else {
             eprintln!("Session is not initialized.");
         }

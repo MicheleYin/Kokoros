@@ -23,7 +23,7 @@ ogg = "0.9"
 
 # Base ONNX Runtime configuration
 # Use official ort from crates.io
-ort = { version = "2.0.0-rc.10", default-features = true }
+ort = { version = "2.0.0-rc.12",  feature-default=true}
 
 [[example]]
 name = "test_phonemizer"
